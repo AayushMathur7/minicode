@@ -1,0 +1,20 @@
+{
+  "name": "minicode",
+  "module": "index.ts",
+  "type": "module",
+  "private": true,
+  "devDependencies": {
+    "@types/bun": "latest"
+  },
+  "peerDependencies": {
+    "typescript": "^5"
+  },
+  "dependencies": {
+    "openai": "^6.33.0",
+    "zod": "^4.3.6"
+  },
+  "scripts": {
+    "dev": "tsx src/index.ts",
+    "check": "tsc --noEmit"
+  }
+}
