@@ -80,6 +80,7 @@ export const runCommandTool: ToolDefinition = {
                 timeout: DEFAULT_TIMEOUT_MS,
                 maxBuffer: DEFAULT_MAX_BUFFER,
                 cwd: context.cwd,
+                signal: context.signal,
             });
 
             const output = [stdout, stderr]

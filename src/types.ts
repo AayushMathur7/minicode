@@ -41,6 +41,7 @@ export type ToolAccessLevel = "read" | "write";
 
 export type ToolExecutionContext = {
     cwd: string;
+    signal?: AbortSignal;
 };
 
 // ToolDefinition is owned by the runtime, not the model.
@@ -103,6 +104,7 @@ export type AgentEvent =
 | { type: "tool_failed"; toolName: string; error: string }
 | { type: "final_message"; content: string }
 | { type: "run_completed"; totalSteps: number; durationMs: number }
+| { type: "run_cancelled"; reason?: string }
 | { type: "run_failed"; error: string }
 | { type: "permission_requested"; toolName: string; accessLevel: ToolAccessLevel }
 | { type: "permission_resolved"; toolName: string; decision: PermissionDecision };

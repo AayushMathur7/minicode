@@ -5,6 +5,7 @@ export type ClientInput = {
     // The model has no memory unless you pass it in here.
     messages: Message[];
     tools: ToolMetadata[];
+    signal?: AbortSignal;
 };
 
 export interface ModelClient {

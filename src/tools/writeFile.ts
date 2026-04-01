@@ -38,11 +38,18 @@ export const writeFileTool: ToolDefinition = {
         additionalProperties: false,
     },
     execute: async (args: Record<string, unknown>, context) => {
+        if (context.signal?.aborted) {
+            throw new Error(String(context.signal.reason ?? "cancelled"));
+        }
+
         const filePath = assertNonEmptyString(args.path, "path");
         const content = typeof args.content === "string" ? args.content : "";
         const resolvedPath = resolveWorkspacePath(context.cwd, filePath);
 
         await fs.mkdir(path.dirname(resolvedPath), { recursive: true });
+        if (context.signal?.aborted) {
+            throw new Error(String(context.signal.reason ?? "cancelled"));
+        }
         await fs.writeFile(resolvedPath, content, "utf8");
 
         return `Wrote ${resolvedPath}`;

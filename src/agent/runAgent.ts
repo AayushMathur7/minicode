@@ -13,6 +13,21 @@ import {
 } from "./session";
 import type { PermissionDecision } from "../tools/permissions";
 
+class RunCancelledError extends Error {
+    constructor(message: string) {
+        super(message);
+        this.name = "RunCancelledError";
+    }
+}
+
+function throwIfAborted(signal?: AbortSignal): void {
+    if (!signal?.aborted) {
+        return;
+    }
+
+    throw new RunCancelledError(String(signal.reason ?? "cancelled"));
+}
+
 function getToolCallSignature(
     toolName: string,
     args: Record<string, unknown>,
@@ -38,6 +53,7 @@ export async function runAgent(
     options: {
         cwd?: string;
         toolPolicyMode?: ToolPolicyMode;
+        signal?: AbortSignal;
     } = {},
     onEvent?: (event: AgentEvent, state: SessionState) => void,
     requestPermission?: (params: {
@@ -59,6 +75,7 @@ export async function runAgent(
     // Tools execute relative to the provided cwd so filesystem operations stay scoped.
     const executionContext: ToolExecutionContext = {
         cwd: options.cwd ?? process.cwd(),
+        signal: options.signal,
     };
 
     // Resolve which tools are available for the current policy mode, and prepare
@@ -85,176 +102,208 @@ export async function runAgent(
     let successfulWriteCount = 0;
     let postWriteToolCalls = 0;
     const toolCallCounts = new Map<string, number>();
-    while (steps < maxSteps) {
-        steps++;
-        sessionState = recordStepStart(sessionState, steps);
-        onEvent?.({ type: "step_started", step: steps }, sessionState);
+    try {
+        while (steps < maxSteps) {
+            steps++;
+            sessionState = recordStepStart(sessionState, steps);
+            onEvent?.({ type: "step_started", step: steps }, sessionState);
 
-        // Ask the model what to do next given the current conversation and tool list.
-        const step: AgentStep = await client.next({ messages, tools: toolMetadata });
+            throwIfAborted(options.signal);
 
-        // A plain message means the model is done and has produced the final answer.
-        if (step.type === "message") {
-            onEvent?.({ type: "model_responded", step: steps, responseType: "message" }, sessionState);
-            const message: Message = {
-                role: step.message.role,
-                content: step.message.content,
-            };
-
-            // Keep the final message in the conversation history and session state for observers.
-            messages.push(message);
-            sessionState = recordFinalMessage(sessionState, message.content);
-            onEvent?.({ type: "final_message", content: message.content }, sessionState);
-            onEvent?.(
-                {
-                    type: "run_completed",
-                    totalSteps: steps,
-                    durationMs: Date.now() - sessionState.startedAt,
-                },
-                sessionState,
-            );
-            return message;
-        }
-
-        // Otherwise the model wants to call a tool.
-        onEvent?.({ type: "model_responded", step: steps, responseType: "tool_call" }, sessionState);
-
-        const tool: ToolDefinition | undefined = toolMap.get(step.call.toolName);
-        sessionState = recordToolRequested(sessionState, step.call.toolName, step.call.args);
-        onEvent?.({ type: "tool_requested", toolName: step.call.toolName, args: step.call.args }, sessionState);
-
-        const toolCallSignature = getToolCallSignature(
-            step.call.toolName,
-            step.call.args,
-        );
-        const nextCallCount = (toolCallCounts.get(toolCallSignature) ?? 0) + 1;
-        toolCallCounts.set(toolCallSignature, nextCallCount);
-
-        if (nextCallCount >= 3) {
-            const error = `Loop detected: repeated tool call ${step.call.toolName}`;
-            onEvent?.({ type: "run_failed", error }, sessionState);
-            throw new Error(error);
-        }
-
-        // If the model asked for a tool that is not available under the current policy,
-        // feed that failure back into the conversation so it can recover on the next step.
-        if (!tool) {
-            onEvent?.(
-                {
-                    type: "tool_failed",
-                    toolName: step.call.toolName,
-                    error: `Tool ${step.call.toolName} not found`,
-                },
-                sessionState,
-            );
-            messages.push({
-                role: "assistant",
-                content: `Tool ${step.call.toolName} not found`,
+            // Ask the model what to do next given the current conversation and tool list.
+            const step: AgentStep = await client.next({
+                messages,
+                tools: toolMetadata,
+                signal: options.signal,
             });
-            continue;
-        }
 
-        try {
-            let preview: string | undefined;
+            throwIfAborted(options.signal);
 
-            if (tool.name === "apply_patch") {
-                const preparedPatch = await prepareApplyPatch(step.call.args, executionContext);
-                preview = preparedPatch.preview;
+            // A plain message means the model is done and has produced the final answer.
+            if (step.type === "message") {
+                onEvent?.({ type: "model_responded", step: steps, responseType: "message" }, sessionState);
+                const message: Message = {
+                    role: step.message.role,
+                    content: step.message.content,
+                };
+
+                // Keep the final message in the conversation history and session state for observers.
+                messages.push(message);
+                sessionState = recordFinalMessage(sessionState, message.content);
+                onEvent?.({ type: "final_message", content: message.content }, sessionState);
                 onEvent?.(
                     {
-                        type: "diff_preview_ready",
-                        toolName: tool.name,
-                        path: preparedPatch.displayPath,
-                        preview,
+                        type: "run_completed",
+                        totalSteps: steps,
+                        durationMs: Date.now() - sessionState.startedAt,
                     },
                     sessionState,
                 );
+                return message;
             }
 
-            // Write-capable tools require an explicit permission decision.
-            // If no permission callback is provided, the default is to deny.
-            if (tool.accessLevel === "write") {
-                onEvent?.(
-                    {
-                        type: "permission_requested",
-                        toolName: step.call.toolName,
-                        accessLevel: tool.accessLevel,
-                    },
-                    sessionState,
-                );
+            // Otherwise the model wants to call a tool.
+            onEvent?.({ type: "model_responded", step: steps, responseType: "tool_call" }, sessionState);
 
-                const decision =
-                    (await requestPermission?.({
-                        toolName: tool.name,
-                        accessLevel: tool.accessLevel,
-                        args: step.call.args,
-                        preview,
-                    })) ?? "deny";
+            const tool: ToolDefinition | undefined = toolMap.get(step.call.toolName);
+            sessionState = recordToolRequested(sessionState, step.call.toolName, step.call.args);
+            onEvent?.({ type: "tool_requested", toolName: step.call.toolName, args: step.call.args }, sessionState);
 
-                onEvent?.(
-                    {
-                        type: "permission_resolved",
-                        toolName: step.call.toolName,
-                        decision,
-                    },
-                    sessionState,
-                );
-
-                // Permission denials are returned to the model as tool output so it can choose another path.
-                if (decision === "deny") {
-                    messages.push({
-                        role: "tool",
-                        name: tool.name,
-                        content: "Permission denied by user",
-                    });
-                    continue;
-                }
-            }
-
-            onEvent?.({ type: "tool_started", toolName: step.call.toolName }, sessionState);
-
-            // Execute the tool, store a short preview for UI/session history,
-            // then append the full result so the model can use it on the next turn.
-            const result = await tool.execute(step.call.args, executionContext);
-            const resultPreview = result.substring(0, 100);
-            sessionState = recordToolFinished(sessionState, step.call.toolName, resultPreview);
-            onEvent?.(
-                { type: "tool_finished", toolName: step.call.toolName, preview: resultPreview },
-                sessionState,
+            const toolCallSignature = getToolCallSignature(
+                step.call.toolName,
+                step.call.args,
             );
-            messages.push({
-                role: "tool",
-                content: result,
-                name: step.call.toolName,
-            });
-            onEvent?.({ type: "tool_output_appended", toolName: step.call.toolName }, sessionState);
+            const nextCallCount = (toolCallCounts.get(toolCallSignature) ?? 0) + 1;
+            toolCallCounts.set(toolCallSignature, nextCallCount);
 
-            if (tool.name === "write_file" || tool.name === "apply_patch") {
-                successfulWriteCount += 1;
-                postWriteToolCalls = 0;
-            } else if (successfulWriteCount > 0) {
-                postWriteToolCalls += 1;
-            }
-
-            if (postWriteToolCalls >= 4) {
-                const error = "Loop detected: too many tool calls after a successful write";
+            if (nextCallCount >= 3) {
+                const error = `Loop detected: repeated tool call ${step.call.toolName}`;
                 onEvent?.({ type: "run_failed", error }, sessionState);
                 throw new Error(error);
             }
-        } catch (error) {
+
+            // If the model asked for a tool that is not available under the current policy,
+            // feed that failure back into the conversation so it can recover on the next step.
+            if (!tool) {
+                onEvent?.(
+                    {
+                        type: "tool_failed",
+                        toolName: step.call.toolName,
+                        error: `Tool ${step.call.toolName} not found`,
+                    },
+                    sessionState,
+                );
+                messages.push({
+                    role: "assistant",
+                    content: `Tool ${step.call.toolName} not found`,
+                });
+                continue;
+            }
+
+            try {
+                let preview: string | undefined;
+
+                if (tool.name === "apply_patch") {
+                    throwIfAborted(options.signal);
+                    const preparedPatch = await prepareApplyPatch(step.call.args, executionContext);
+                    preview = preparedPatch.preview;
+                    onEvent?.(
+                        {
+                            type: "diff_preview_ready",
+                            toolName: tool.name,
+                            path: preparedPatch.displayPath,
+                            preview,
+                        },
+                        sessionState,
+                    );
+                }
+
+                // Write-capable tools require an explicit permission decision.
+                // If no permission callback is provided, the default is to deny.
+                if (tool.accessLevel === "write") {
+                    throwIfAborted(options.signal);
+                    onEvent?.(
+                        {
+                            type: "permission_requested",
+                            toolName: step.call.toolName,
+                            accessLevel: tool.accessLevel,
+                        },
+                        sessionState,
+                    );
+
+                    const decision =
+                        (await requestPermission?.({
+                            toolName: tool.name,
+                            accessLevel: tool.accessLevel,
+                            args: step.call.args,
+                            preview,
+                        })) ?? "deny";
+
+                    throwIfAborted(options.signal);
+
+                    onEvent?.(
+                        {
+                            type: "permission_resolved",
+                            toolName: step.call.toolName,
+                            decision,
+                        },
+                        sessionState,
+                    );
+
+                    // Permission denials are returned to the model as tool output so it can choose another path.
+                    if (decision === "deny") {
+                        messages.push({
+                            role: "tool",
+                            name: tool.name,
+                            content: "Permission denied by user",
+                        });
+                        continue;
+                    }
+                }
+
+                throwIfAborted(options.signal);
+                onEvent?.({ type: "tool_started", toolName: step.call.toolName }, sessionState);
+
+                // Execute the tool, store a short preview for UI/session history,
+                // then append the full result so the model can use it on the next turn.
+                const result = await tool.execute(step.call.args, executionContext);
+                throwIfAborted(options.signal);
+                const resultPreview = result.substring(0, 100);
+                sessionState = recordToolFinished(sessionState, step.call.toolName, resultPreview);
+                onEvent?.(
+                    { type: "tool_finished", toolName: step.call.toolName, preview: resultPreview },
+                    sessionState,
+                );
+                messages.push({
+                    role: "tool",
+                    content: result,
+                    name: step.call.toolName,
+                });
+                onEvent?.({ type: "tool_output_appended", toolName: step.call.toolName }, sessionState);
+
+                if (tool.name === "write_file" || tool.name === "apply_patch") {
+                    successfulWriteCount += 1;
+                    postWriteToolCalls = 0;
+                } else if (successfulWriteCount > 0) {
+                    postWriteToolCalls += 1;
+                }
+
+                if (postWriteToolCalls >= 4) {
+                    const error = "Loop detected: too many tool calls after a successful write";
+                    onEvent?.({ type: "run_failed", error }, sessionState);
+                    throw new Error(error);
+                }
+            } catch (error) {
+                if (error instanceof RunCancelledError) {
+                    throw error;
+                }
+
+                onEvent?.(
+                    {
+                        type: "tool_failed",
+                        toolName: step.call.toolName,
+                        error: error instanceof Error ? error.message : String(error),
+                    },
+                    sessionState,
+                );
+                throw error;
+            }
+        }
+
+        // Hitting the step limit is treated as a run failure instead of silently stopping.
+        onEvent?.({ type: "run_failed", error: `Max steps reached: ${maxSteps}` }, sessionState);
+        throw new Error(`Max steps reached: ${maxSteps}`);
+    } catch (error) {
+        if (error instanceof RunCancelledError) {
             onEvent?.(
                 {
-                    type: "tool_failed",
-                    toolName: step.call.toolName,
-                    error: error instanceof Error ? error.message : String(error),
+                    type: "run_cancelled",
+                    reason: error.message,
                 },
                 sessionState,
             );
-            throw error;
         }
-    }
 
-    // Hitting the step limit is treated as a run failure instead of silently stopping.
-    onEvent?.({ type: "run_failed", error: `Max steps reached: ${maxSteps}` }, sessionState);
-    throw new Error(`Max steps reached: ${maxSteps}`);
+        throw error;
+    }
 }

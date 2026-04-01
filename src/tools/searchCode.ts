@@ -24,6 +24,10 @@ export const searchCodeTool: ToolDefinition = {
         try {
             const { stdout, stderr } = await execFileAsync("rg", [
                 "-n",
+                // Treat the query as literal text. The model usually wants plain
+                // code/text search, and regex metacharacters like `(` should not
+                // cause the search itself to fail.
+                "-F",
                 "--hidden",
                 "--glob",
                 "!.git",
@@ -31,6 +35,7 @@ export const searchCodeTool: ToolDefinition = {
                 ".",
             ], {
                 cwd: context.cwd,
+                signal: context.signal,
             });
 
             return stdout || stderr || `No matches found for "${query}"`;

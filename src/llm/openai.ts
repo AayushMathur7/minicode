@@ -133,23 +133,28 @@ export class OpenAIClient implements ModelClient {
             ]
             : undefined;
 
-        const response = await this.client.responses.create({
-            model: "gpt-5",
-            reasoning: { effort: "high" },
-            text: { verbosity: "medium" },
-            stream: false,
-            // We use previous_response_id for native tool-call continuity, so the
-            // response needs to remain available to the Responses API between turns.
-            store: true,
-            // The runtime owns the canonical message history. This adapter only maps
-            // that history into the provider-specific input format.
-            input: functionCallOutput ?? input.messages.map(mapMessageToResponseInput),
-            // We expose the runtime's tool metadata through OpenAI's native function
-            // tool declarations. The model chooses a tool, but the runtime executes it.
-            tools: input.tools.map(mapToolToOpenAIFunction),
-            tool_choice: "auto",
-            previous_response_id: isContinuingToolLoop ? this.previousResponseId : undefined,
-        }) as Response;
+        const response = await this.client.responses.create(
+            {
+                model: "gpt-5",
+                reasoning: { effort: "high" },
+                text: { verbosity: "medium" },
+                stream: false,
+                // We use previous_response_id for native tool-call continuity, so the
+                // response needs to remain available to the Responses API between turns.
+                store: true,
+                // The runtime owns the canonical message history. This adapter only maps
+                // that history into the provider-specific input format.
+                input: functionCallOutput ?? input.messages.map(mapMessageToResponseInput),
+                // We expose the runtime's tool metadata through OpenAI's native function
+                // tool declarations. The model chooses a tool, but the runtime executes it.
+                tools: input.tools.map(mapToolToOpenAIFunction),
+                tool_choice: "auto",
+                previous_response_id: isContinuingToolLoop ? this.previousResponseId : undefined,
+            },
+            {
+                signal: input.signal,
+            },
+        ) as Response;
 
         this.previousResponseId = response.id;
 

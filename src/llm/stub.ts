@@ -3,6 +3,12 @@ import { type ClientInput, type ModelClient } from "./client";
 
 export class StubClient implements ModelClient {
     async next(input: ClientInput): Promise<AgentStep> {
+        if (input.signal?.aborted) {
+            throw input.signal.reason instanceof Error
+                ? input.signal.reason
+                : new Error(String(input.signal.reason ?? "cancelled"));
+        }
+
         const latestToolMessage = [...input.messages]
             .reverse()
             .find((message) => message.role === "tool");

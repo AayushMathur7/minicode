@@ -18,6 +18,10 @@ export const readFileTool: ToolDefinition = {
         additionalProperties: false,
     },
     execute: async (args: Record<string, unknown>, context) => {
+        if (context.signal?.aborted) {
+            throw new Error(String(context.signal.reason ?? "cancelled"));
+        }
+
         const path = args.path as string;
         const resolvedPath = path.startsWith("/")
             ? path
