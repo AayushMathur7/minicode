@@ -108,7 +108,7 @@ function renderTextWithPathHighlight(content: string, keyPrefix: string): React.
         }
 
         elements.push(
-            <Text key={`${keyPrefix}-path-${matchIndex}`} color="cyan" inverse={true}>
+            <Text key={`${keyPrefix}-path-${matchIndex}`} color="cyan" bold={true}>
                 {matchedValue}
             </Text>,
         );
@@ -132,10 +132,10 @@ function renderTextWithPathHighlight(content: string, keyPrefix: string): React.
 
 function renderInlineCode(content: string, key: string): React.ReactElement {
     return (
-        <Text key={key} color="cyan" inverse={true}>
+        <Text key={key} color="cyan" bold={true}>
             {highlightCodeLine(content).map((token, tokenIndex) =>
                 renderCodeToken(token, tokenIndex, {
-                    inverse: true,
+                    bold: true,
                 }),
             )}
         </Text>

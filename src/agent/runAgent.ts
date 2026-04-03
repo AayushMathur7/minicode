@@ -14,6 +14,7 @@ import {
     recordToolRequested,
 } from "./session";
 import type { PermissionDecision } from "../tools/permissions";
+import { loadHookConfig, runHooks } from "../utils/hook";
 
 class RunCancelledError extends Error {
     constructor(message: string) {
@@ -86,6 +87,8 @@ export async function runAgent(
         sessionId,
         agentMode,
     };
+
+    const hookConfig = loadHookConfig(executionContext.cwd);
 
     function getVisibleToolState(currentMode: AgentMode): {
         toolMap: Map<string, ToolDefinition>;
@@ -375,6 +378,22 @@ export async function runAgent(
                 throwIfAborted(options.signal);
                 onEvent?.({ type: "tool_started", toolName: step.call.toolName }, sessionState);
 
+                // --- PreToolUse hooks ---
+                const preHookResult = await runHooks(
+                    hookConfig, "PreToolUse",
+                    step.call.toolName, step.call.args,
+                    executionContext.cwd,
+                );
+                if (preHookResult.blocked) {
+                    const reason = preHookResult.reason ?? "Blocked by hook";
+                    onEvent?.({ type: "tool_failed", toolName: step.call.toolName, error: reason }, sessionState);
+                    messages.push({ role: "tool", name: step.call.toolName, content: reason });
+                    continue;
+                }
+                if (preHookResult.updatedInput) {
+                    step.call.args = preHookResult.updatedInput;
+                }
+
                 // Execute the tool, store a short preview for UI/session history,
                 // then append the full result so the model can use it on the next turn.
                 let result: string;
@@ -393,6 +412,15 @@ export async function runAgent(
                     { type: "tool_finished", toolName: step.call.toolName, preview: resultPreview },
                     sessionState,
                 );
+
+                // --- PostToolUse hooks ---
+                await runHooks(
+                    hookConfig, "PostToolUse",
+                    step.call.toolName, step.call.args,
+                    executionContext.cwd,
+                    { tool_response: result },
+                );
+
                 messages.push({
                     role: "tool",
                     content: result,

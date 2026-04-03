@@ -58,6 +58,26 @@ export function App({ initialPrompt }: Props): React.ReactElement {
     const initialPromptSubmittedRef = useRef(false);
     const sessionIdRef = useRef(randomUUID());
     const [isCompacting, setIsCompacting] = useState(false);
+    const [transcriptScrollOffset, setTranscriptScrollOffset] = useState(0);
+    const terminalRows = process.stdout.rows ?? 24;
+    const reservedRows =
+        11
+        + (state.activeRun.status === "awaiting_permission" ? 4 : 0)
+        + (state.activeRun.status === "awaiting_plan_approval" ? 8 : 0)
+        + (state.activeRun.diffPreview ? 10 : 0)
+        + (state.activeRun.error ? 2 : 0);
+    const transcriptViewportSize = Math.max(4, terminalRows - reservedRows);
+    const maxTranscriptScrollOffset = Math.max(0, state.transcript.length - transcriptViewportSize);
+    const transcriptStartIndex = Math.max(
+        0,
+        state.transcript.length - transcriptViewportSize - transcriptScrollOffset,
+    );
+    const visibleTranscript = state.transcript.slice(
+        transcriptStartIndex,
+        transcriptStartIndex + transcriptViewportSize,
+    );
+    const showEarlierMessages = transcriptStartIndex > 0;
+    const showLaterMessages = transcriptStartIndex + visibleTranscript.length < state.transcript.length;
 
     const handlePermissionDecision = useCallback((decision: PermissionDecision): void => {
         permissionResolverRef.current?.(decision);
@@ -279,6 +299,7 @@ export function App({ initialPrompt }: Props): React.ReactElement {
         ];
 
         dispatch({ type: "prompt_submitted", prompt: trimmedPrompt });
+        setTranscriptScrollOffset(0);
         void startRun(trimmedPrompt, transcriptMessages, mode);
     }, [
         getConversationMessages,
@@ -315,6 +336,40 @@ export function App({ initialPrompt }: Props): React.ReactElement {
             }
 
             exit();
+            return;
+        }
+
+        if (key.upArrow) {
+            setTranscriptScrollOffset((current) => Math.min(maxTranscriptScrollOffset, current + 1));
+            return;
+        }
+
+        if (key.downArrow) {
+            setTranscriptScrollOffset((current) => Math.max(0, current - 1));
+            return;
+        }
+
+        if (key.pageUp) {
+            setTranscriptScrollOffset((current) =>
+                Math.min(maxTranscriptScrollOffset, current + Math.max(3, Math.floor(transcriptViewportSize / 2))),
+            );
+            return;
+        }
+
+        if (key.pageDown) {
+            setTranscriptScrollOffset((current) =>
+                Math.max(0, current - Math.max(3, Math.floor(transcriptViewportSize / 2))),
+            );
+            return;
+        }
+
+        if (key.home) {
+            setTranscriptScrollOffset(maxTranscriptScrollOffset);
+            return;
+        }
+
+        if (key.end) {
+            setTranscriptScrollOffset(0);
             return;
         }
 
@@ -362,6 +417,10 @@ export function App({ initialPrompt }: Props): React.ReactElement {
     });
 
     useEffect(() => {
+        setTranscriptScrollOffset((current) => Math.min(current, maxTranscriptScrollOffset));
+    }, [maxTranscriptScrollOffset]);
+
+    useEffect(() => {
         return () => {
             if (permissionResolverRef.current) {
                 permissionResolverRef.current("deny");
@@ -397,7 +456,11 @@ export function App({ initialPrompt }: Props): React.ReactElement {
         <Box flexDirection="column">
             <Banner />
             <ContextMeter budget={state.contextBudget} compacted={Boolean(state.compactedContext)} />
-            <Transcript transcript={state.transcript} />
+            <Transcript
+                transcript={visibleTranscript}
+                showEarlier={showEarlierMessages}
+                showLater={showLaterMessages}
+            />
             <InlineRunStatus state={state.activeRun} />
             <DiffPreview diffPreview={state.activeRun.diffPreview} />
             <PermissionPrompt

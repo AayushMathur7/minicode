@@ -5,6 +5,8 @@ import { RichText } from "./RichText";
 
 type Props = {
     transcript: TranscriptEntry[];
+    showEarlier?: boolean;
+    showLater?: boolean;
 };
 
 function getToolCallAccent(toolName: string | undefined): {
@@ -59,9 +61,14 @@ function getToolResultAccent(toolName: string | undefined): {
     }
 }
 
-export function Transcript({ transcript }: Props): React.ReactElement {
+export function Transcript({
+    transcript,
+    showEarlier = false,
+    showLater = false,
+}: Props): React.ReactElement {
     return (
         <Box flexDirection="column">
+            {showEarlier ? <Text dimColor={true}>↑ earlier messages</Text> : null}
             {transcript.length === 0 ? (
                 <Text dimColor={true}>What should I help with?</Text>
             ) : (
@@ -137,6 +144,7 @@ export function Transcript({ transcript }: Props): React.ReactElement {
                     );
                 })
             )}
+            {showLater ? <Text dimColor={true}>↓ newer messages</Text> : null}
         </Box>
     );
 }

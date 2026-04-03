@@ -1,0 +1,26 @@
+{
+    "hooks": {
+      "PreToolUse": [
+        {
+          "matcher": "Bash",
+          "hooks": [
+            {
+              "type": "command",
+              "command": "\"$MINICODE_PROJECT_DIR\"/.minicode/hooks/safety-check.sh"
+            }
+          ]
+        }
+      ],
+      "PostToolUse": [
+        {
+          "matcher": "Write|Edit",
+          "hooks": [
+            {
+              "type": "command",
+              "command": "jq -r '.tool_input.file_path' | xargs npx prettier --write 2>/dev/null; exit 0"
+            }
+          ]
+        }
+      ]
+    }
+  }

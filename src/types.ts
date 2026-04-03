@@ -133,3 +133,21 @@ export type AgentEvent =
     outputTokens?: number;
     totalTokens?: number;
 };
+
+export type HookEvent =
+| "PreToolUse"
+| "PostToolUse"
+| "SessionStart"
+| "Stop";
+export interface HookConfig {
+    hooks: {
+      [event in HookEvent]?: Array<{
+        matcher?: string;           // regex to filter (e.g., tool name)
+        hooks: Array<{
+          type: "command";
+          command: string;           // shell command to run
+          timeout?: number;          // seconds
+        }>;
+      }>;
+    };
+  }
