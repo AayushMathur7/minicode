@@ -2,6 +2,10 @@ import { type AgentStep } from "../types";
 import { type ClientInput, type ModelClient } from "./client";
 
 export class StubClient implements ModelClient {
+    hasPendingToolCalls(): boolean {
+        return false;
+    }
+
     async next(input: ClientInput): Promise<AgentStep> {
         if (input.signal?.aborted) {
             throw input.signal.reason instanceof Error

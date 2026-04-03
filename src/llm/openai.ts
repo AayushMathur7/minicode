@@ -408,6 +408,10 @@ export class OpenAIClient implements ModelClient {
         };
     }
 
+    hasPendingToolCalls(): boolean {
+        return this.pendingFunctionCalls.length > 0;
+    }
+
     async next(input: ClientInput): Promise<AgentStep> {
         const pendingState = this.getPendingToolLoopState(input);
         const nextPendingToolCall = this.consumeLatestToolOutput(input, pendingState);

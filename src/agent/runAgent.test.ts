@@ -9,6 +9,13 @@ import type { AgentStep, Message } from "../types";
 class ScriptedClient implements ModelClient {
     constructor(private readonly steps: AgentStep[]) {}
 
+    hasPendingToolCalls(): boolean {
+        // ScriptedClient simulates one-at-a-time delivery (like user interaction),
+        // not OpenAI's multi-call batching. Return false so concurrency batching
+        // doesn't interfere with serial test expectations.
+        return false;
+    }
+
     async next(): Promise<AgentStep> {
         const step = this.steps.shift();
 

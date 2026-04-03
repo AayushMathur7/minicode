@@ -181,7 +181,7 @@ export async function runAgent(
             }
 
             // Ask the model what to do next given the current conversation and tool list.
-            const step: AgentStep = await client.next({
+            let step: AgentStep = await client.next({
                 messages,
                 tools: toolMetadata,
                 signal: options.signal,
@@ -254,6 +254,111 @@ export async function runAgent(
 
             // Otherwise the model wants to call a tool.
             onEvent?.({ type: "model_responded", step: steps, responseType: "tool_call" }, sessionState);
+
+            // ---------------------------------------------------------------
+            // Read/Write Partitioned Concurrency
+            // ---------------------------------------------------------------
+            // When the model returns multiple tool calls in one response (e.g.
+            // "read these 5 files"), OpenAI buffers them in pendingFunctionCalls.
+            // We collect all consecutive READ-ONLY calls and run them in
+            // parallel via Promise.all(). Write calls execute serially as before.
+            //
+            // This is the minicode equivalent of Claude Code's
+            // isConcurrencySafe / readers-writer lock pattern
+            // (see Concept #2 in notes/CONCEPTS.md).
+            // ---------------------------------------------------------------
+
+            // Collect the current call + any buffered read-only calls into a batch
+            type PendingCall = { toolName: string; args: Record<string, unknown>; tool: ToolDefinition };
+            const readBatch: PendingCall[] = [];
+
+            // First call: check if it's a read AND there are more buffered calls.
+            // Skip batching for the agent tool — it has its own concurrency model.
+            const firstTool = step.type === "tool_call" ? toolMap.get(step.call.toolName) : undefined;
+            if (step.type === "tool_call" && firstTool?.accessLevel === "read" && firstTool.name !== "agent" && client.hasPendingToolCalls()) {
+                const seenSignatures = new Set<string>();
+                const firstSig = getToolCallSignature(step.call.toolName, step.call.args);
+                seenSignatures.add(firstSig);
+
+                // It's a read AND there are more buffered calls — start batching
+                readBatch.push({ toolName: step.call.toolName, args: step.call.args, tool: firstTool });
+
+                // Drain buffered calls, stopping at duplicates or writes
+                while (client.hasPendingToolCalls()) {
+                    const nextStep = await client.next({ messages, tools: toolMetadata, signal: options.signal });
+                    if (nextStep.type !== "tool_call") break;
+                    const nextTool = toolMap.get(nextStep.call.toolName);
+                    if (!nextTool) break;
+
+                    // Duplicate detection — a repeated call in a batch is
+                    // likely a model loop. Stop batching and let the serial
+                    // path's loop detector handle it.
+                    const sig = getToolCallSignature(nextStep.call.toolName, nextStep.call.args);
+                    if (seenSignatures.has(sig)) {
+                        // Put this duplicate into the batch as-is so it goes
+                        // through the serial path below (which has loop detection).
+                        readBatch.push({ toolName: nextStep.call.toolName, args: nextStep.call.args, tool: nextTool });
+                        break;
+                    }
+                    seenSignatures.add(sig);
+
+                    if (nextTool.accessLevel !== "read") {
+                        // Hit a write tool — include it so it gets executed serially after the reads
+                        readBatch.push({ toolName: nextStep.call.toolName, args: nextStep.call.args, tool: nextTool });
+                        break;
+                    }
+                    readBatch.push({ toolName: nextStep.call.toolName, args: nextStep.call.args, tool: nextTool });
+                }
+            }
+
+            // If we collected a batch of 2+ calls, execute reads in parallel
+            if (readBatch.length >= 2) {
+                // Partition into reads (parallel) and the trailing write (serial)
+                const reads = readBatch.filter(c => c.tool.accessLevel === "read");
+                const writes = readBatch.filter(c => c.tool.accessLevel !== "read");
+
+                if (reads.length > 0) {
+                    onEvent?.({ type: "tool_started", toolName: `${reads.length} reads in parallel` }, sessionState);
+
+                    const readResults = await Promise.all(
+                        reads.map(async (call) => {
+                            sessionState = recordToolRequested(sessionState, call.toolName, call.args);
+                            onEvent?.({ type: "tool_requested", toolName: call.toolName, args: call.args }, sessionState);
+                            try {
+                                const result = await call.tool.execute(call.args, executionContext);
+                                const preview = result.substring(0, 100);
+                                sessionState = recordToolFinished(sessionState, call.toolName, preview);
+                                onEvent?.({ type: "tool_finished", toolName: call.toolName, preview }, sessionState);
+                                return { toolName: call.toolName, result };
+                            } catch (error) {
+                                const msg = error instanceof Error ? error.message : String(error);
+                                onEvent?.({ type: "tool_failed", toolName: call.toolName, error: msg }, sessionState);
+                                return { toolName: call.toolName, result: `Error: ${msg}` };
+                            }
+                        }),
+                    );
+
+                    // Push all read results into messages
+                    for (const { toolName, result } of readResults) {
+                        messages.push({ role: "tool", content: result, name: toolName });
+                        onEvent?.({ type: "tool_output_appended", toolName }, sessionState);
+                    }
+                }
+
+                // Execute any trailing write call serially (falls through to normal path below)
+                if (writes.length > 0) {
+                    const writeCall = writes[0]!;
+                    // Synthesize a step so the normal serial path handles it
+                    step = { type: "tool_call", call: { toolName: writeCall.toolName, args: writeCall.args } };
+                } else {
+                    // All reads done, loop back to ask model for next step
+                    continue;
+                }
+            }
+
+            // ---------------------------------------------------------------
+            // Serial execution path (single call, or write after batch)
+            // ---------------------------------------------------------------
 
             const tool: ToolDefinition | undefined = toolMap.get(step.call.toolName);
             sessionState = recordToolRequested(sessionState, step.call.toolName, step.call.args);

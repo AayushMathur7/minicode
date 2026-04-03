@@ -20,6 +20,10 @@ function assistant(content: string): Message {
 class SummaryClient implements ModelClient {
     constructor(private readonly step: AgentStep) {}
 
+    hasPendingToolCalls(): boolean {
+        return false;
+    }
+
     async next(): Promise<AgentStep> {
         return this.step;
     }

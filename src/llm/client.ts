@@ -19,6 +19,15 @@ export type ModelUsageEvent = {
 
 export interface ModelClient {
     next(input: ClientInput): Promise<AgentStep>;
+
+    /**
+     * Returns true if the client has buffered tool calls from a previous
+     * multi-tool response that haven't been returned yet.
+     *
+     * Used by the agent loop to collect a full batch of tool calls before
+     * executing them — enabling read/write partitioned concurrency.
+     */
+    hasPendingToolCalls(): boolean;
 }
 
 export type ClientInput = {
