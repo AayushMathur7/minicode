@@ -1,9 +1,11 @@
 import { type ModelClient } from "../llm/client";
 import { buildMessages } from "../context/buildMessages";
-import { buildToolMap, getToolsForPolicy } from "../tools";
-import { prepareApplyPatch } from "../tools/applyPatch";
-import { type AgentEvent, type AgentStep, type Message, type SessionState, type ToolAccessLevel, type ToolDefinition, type ToolExecutionContext, type ToolMetadata } from "../types";
-import { type ToolPolicyMode } from "../tools/policy";
+import { allTools, buildToolMap } from "../tools";
+import { applyPreparedPatch, type PreparedPatch, prepareApplyPatch } from "../tools/applyPatch";
+import { getPlanArtifact, preparePlanApproval, type PreparedPlanApproval } from "./plans";
+import { getSystemPrompt } from "./systemPrompt";
+import { type AgentEvent, type AgentStep, type Message, type PlanApprovalDecision, type SessionState, type ToolAccessLevel, type ToolDefinition, type ToolExecutionContext, type ToolMetadata } from "../types";
+import { type AgentMode, type ToolPolicyMode, getToolsForRuntime } from "../tools/policy";
 import {
     createSessionState,
     recordFinalMessage,
@@ -37,7 +39,7 @@ function getToolCallSignature(
 
 /**
  * Runs the main agent loop until the model returns a final message
- * or the step limit is reached.
+ * or the run is cancelled / a loop guard trips.
  *
  * High-level flow:
  * 1. Build the initial conversation and tool list.
@@ -45,7 +47,7 @@ function getToolCallSignature(
  * 3. If the model responds with a message, finish.
  * 4. If the model requests a tool, optionally ask for permission,
  *    execute the tool, and append the tool result back into the conversation.
- * 5. Repeat until completion or maxSteps.
+ * 5. Repeat until completion.
  */
 export async function runAgent(
     client: ModelClient,
@@ -54,6 +56,8 @@ export async function runAgent(
         cwd?: string;
         toolPolicyMode?: ToolPolicyMode;
         signal?: AbortSignal;
+        mode?: AgentMode;
+        sessionId?: string;
     } = {},
     onEvent?: (event: AgentEvent, state: SessionState) => void,
     requestPermission?: (params: {
@@ -62,31 +66,72 @@ export async function runAgent(
         args: Record<string, unknown>;
         preview?: string;
     }) => Promise<PermissionDecision>,
+    requestPlanApproval?: (params: {
+        filePath: string;
+        content: string;
+    }) => Promise<PlanApprovalDecision>,
 ): Promise<Message> {
     // Default to the safer tool policy unless the caller explicitly opts into another mode.
     const toolPolicyMode = options.toolPolicyMode ?? "safe";
+    const sessionId = options.sessionId ?? `session-${Date.now()}`;
+    let agentMode = options.mode ?? "execute";
 
     // Use the latest user message as the session goal/prompt shown in emitted events.
     const prompt = userMessages[userMessages.length - 1]?.content || "";
-
-    // Start from the caller's messages, then keep appending model/tool outputs as the run progresses.
-    const messages: Message[] = buildMessages(userMessages);
 
     // Tools execute relative to the provided cwd so filesystem operations stay scoped.
     const executionContext: ToolExecutionContext = {
         cwd: options.cwd ?? process.cwd(),
         signal: options.signal,
+        sessionId,
+        agentMode,
     };
 
-    // Resolve which tools are available for the current policy mode, and prepare
-    // both a fast lookup map for runtime execution and metadata for the model.
-    const allowedTools = getToolsForPolicy(toolPolicyMode);
-    const toolMap = buildToolMap(allowedTools);
-    const toolMetadata: ToolMetadata[] = allowedTools.map(({ name, description, inputSchema }) => ({
-        name,
-        description,
-        inputSchema,
-    }));
+    function getVisibleToolState(currentMode: AgentMode): {
+        toolMap: Map<string, ToolDefinition>;
+        toolMetadata: ToolMetadata[];
+    } {
+        const allowedTools = getToolsForRuntime(allTools, currentMode, toolPolicyMode);
+        return {
+            toolMap: buildToolMap(allowedTools),
+            toolMetadata: allowedTools.map(({ name, description, inputSchema }) => ({
+                name,
+                description,
+                inputSchema,
+            })),
+        };
+    }
+
+    let { toolMap, toolMetadata } = getVisibleToolState(agentMode);
+
+    function appendModeSystemMessage(currentMode: AgentMode): void {
+        messages.push({
+            role: "system",
+            content: getSystemPrompt({
+                cwd: executionContext.cwd,
+                toolPolicyMode,
+                agentMode: currentMode,
+                availableToolNames: toolMetadata.map((tool) => tool.name),
+                taskPrompt: prompt,
+            }),
+        });
+    }
+
+    function setAgentMode(nextMode: AgentMode): void {
+        agentMode = nextMode;
+        executionContext.agentMode = nextMode;
+        ({ toolMap, toolMetadata } = getVisibleToolState(nextMode));
+        appendModeSystemMessage(nextMode);
+    }
+
+    // Start from the caller's messages, then keep appending model/tool outputs as the run progresses.
+    const messages: Message[] = buildMessages(userMessages, {
+        cwd: executionContext.cwd,
+        toolPolicyMode,
+        agentMode,
+        availableToolNames: toolMetadata.map((tool) => tool.name),
+        taskPrompt: prompt,
+    });
 
     // Track the run in a session object so renderers / observers can show progress.
     let sessionState: SessionState = createSessionState({
@@ -96,14 +141,13 @@ export async function runAgent(
 
     onEvent?.({ type: "run_started", prompt }, sessionState);
 
-    // Safety valve: prevent the model from looping forever if it keeps asking for tools.
-    const maxSteps = 10;
     let steps = 0;
     let successfulWriteCount = 0;
     let postWriteToolCalls = 0;
-    const toolCallCounts = new Map<string, number>();
+    let repeatedToolCallStreak = 0;
+    let lastToolCallSignature: string | undefined;
     try {
-        while (steps < maxSteps) {
+        while (true) {
             steps++;
             sessionState = recordStepStart(sessionState, steps);
             onEvent?.({ type: "step_started", step: steps }, sessionState);
@@ -115,6 +159,46 @@ export async function runAgent(
                 messages,
                 tools: toolMetadata,
                 signal: options.signal,
+                onStreamEvent: (event) => {
+                    switch (event.type) {
+                        case "thinking_started":
+                            onEvent?.({ type: "model_thinking_started" }, sessionState);
+                            break;
+                        case "thinking_completed":
+                            onEvent?.({ type: "model_thinking_completed" }, sessionState);
+                            break;
+                        case "reasoning_summary_delta":
+                            onEvent?.({ type: "reasoning_summary_delta", chunk: event.chunk }, sessionState);
+                            break;
+                        case "reasoning_summary_completed":
+                            onEvent?.({ type: "reasoning_summary_completed", content: event.content }, sessionState);
+                            break;
+                        case "assistant_text_started":
+                            onEvent?.({ type: "assistant_text_started" }, sessionState);
+                            break;
+                        case "assistant_text_delta":
+                            onEvent?.({ type: "assistant_text_delta", chunk: event.chunk }, sessionState);
+                            break;
+                        case "assistant_text_completed":
+                            onEvent?.({ type: "assistant_text_completed", content: event.content }, sessionState);
+                            break;
+                        case "tool_call_detected":
+                            onEvent?.({ type: "tool_call_detected", toolName: event.toolName }, sessionState);
+                            break;
+                    }
+                },
+                onUsage: (usage) => {
+                    onEvent?.(
+                        {
+                            type: "usage_updated",
+                            model: usage.model,
+                            inputTokens: usage.inputTokens,
+                            outputTokens: usage.outputTokens,
+                            totalTokens: usage.totalTokens,
+                        },
+                        sessionState,
+                    );
+                },
             });
 
             throwIfAborted(options.signal);
@@ -153,10 +237,14 @@ export async function runAgent(
                 step.call.toolName,
                 step.call.args,
             );
-            const nextCallCount = (toolCallCounts.get(toolCallSignature) ?? 0) + 1;
-            toolCallCounts.set(toolCallSignature, nextCallCount);
+            if (toolCallSignature === lastToolCallSignature) {
+                repeatedToolCallStreak += 1;
+            } else {
+                repeatedToolCallStreak = 1;
+                lastToolCallSignature = toolCallSignature;
+            }
 
-            if (nextCallCount >= 3) {
+            if (repeatedToolCallStreak >= 3) {
                 const error = `Loop detected: repeated tool call ${step.call.toolName}`;
                 onEvent?.({ type: "run_failed", error }, sessionState);
                 throw new Error(error);
@@ -182,10 +270,12 @@ export async function runAgent(
 
             try {
                 let preview: string | undefined;
+                let preparedPatch: PreparedPatch | undefined;
+                let preparedPlanApproval: PreparedPlanApproval | undefined;
 
                 if (tool.name === "apply_patch") {
                     throwIfAborted(options.signal);
-                    const preparedPatch = await prepareApplyPatch(step.call.args, executionContext);
+                    preparedPatch = await prepareApplyPatch(step.call.args, executionContext);
                     preview = preparedPatch.preview;
                     onEvent?.(
                         {
@@ -196,6 +286,47 @@ export async function runAgent(
                         },
                         sessionState,
                     );
+                }
+
+                if (tool.name === "exit_plan_mode") {
+                    throwIfAborted(options.signal);
+                    preparedPlanApproval = await preparePlanApproval(
+                        executionContext.cwd,
+                        executionContext.sessionId,
+                    );
+                    onEvent?.(
+                        {
+                            type: "plan_approval_requested",
+                            filePath: preparedPlanApproval.displayPath,
+                            content: preparedPlanApproval.content,
+                        },
+                        sessionState,
+                    );
+
+                    const decision =
+                        (await requestPlanApproval?.({
+                            filePath: preparedPlanApproval.displayPath,
+                            content: preparedPlanApproval.content,
+                        })) ?? "reject";
+
+                    throwIfAborted(options.signal);
+
+                    onEvent?.(
+                        {
+                            type: "plan_approval_resolved",
+                            decision,
+                        },
+                        sessionState,
+                    );
+
+                    if (decision === "reject") {
+                        messages.push({
+                            role: "tool",
+                            name: tool.name,
+                            content: "Plan approval rejected. Stay in plan mode and revise the plan.",
+                        });
+                        continue;
+                    }
                 }
 
                 // Write-capable tools require an explicit permission decision.
@@ -246,7 +377,15 @@ export async function runAgent(
 
                 // Execute the tool, store a short preview for UI/session history,
                 // then append the full result so the model can use it on the next turn.
-                const result = await tool.execute(step.call.args, executionContext);
+                let result: string;
+
+                if (tool.name === "apply_patch" && preparedPatch) {
+                    result = await applyPreparedPatch(preparedPatch, executionContext);
+                } else if (tool.name === "exit_plan_mode" && preparedPlanApproval) {
+                    result = `Exited plan mode. Plan approved in ${preparedPlanApproval.displayPath}`;
+                } else {
+                    result = await tool.execute(step.call.args, executionContext);
+                }
                 throwIfAborted(options.signal);
                 const resultPreview = result.substring(0, 100);
                 sessionState = recordToolFinished(sessionState, step.call.toolName, resultPreview);
@@ -260,6 +399,40 @@ export async function runAgent(
                     name: step.call.toolName,
                 });
                 onEvent?.({ type: "tool_output_appended", toolName: step.call.toolName }, sessionState);
+
+                if (tool.name === "enter_plan_mode" && agentMode !== "plan") {
+                    const planArtifact = getPlanArtifact(executionContext.cwd, executionContext.sessionId);
+                    onEvent?.(
+                        {
+                            type: "plan_mode_entered",
+                            filePath: planArtifact.displayPath,
+                        },
+                        sessionState,
+                    );
+                    setAgentMode("plan");
+                }
+
+                if (tool.name === "write_plan" && agentMode === "plan") {
+                    const planArtifact = getPlanArtifact(executionContext.cwd, executionContext.sessionId);
+                    onEvent?.(
+                        {
+                            type: "plan_written",
+                            filePath: planArtifact.displayPath,
+                        },
+                        sessionState,
+                    );
+                }
+
+                if (tool.name === "exit_plan_mode" && preparedPlanApproval) {
+                    onEvent?.(
+                        {
+                            type: "plan_mode_exited",
+                            filePath: preparedPlanApproval.displayPath,
+                        },
+                        sessionState,
+                    );
+                    setAgentMode("execute");
+                }
 
                 if (tool.name === "write_file" || tool.name === "apply_patch") {
                     successfulWriteCount += 1;
@@ -290,9 +463,6 @@ export async function runAgent(
             }
         }
 
-        // Hitting the step limit is treated as a run failure instead of silently stopping.
-        onEvent?.({ type: "run_failed", error: `Max steps reached: ${maxSteps}` }, sessionState);
-        throw new Error(`Max steps reached: ${maxSteps}`);
     } catch (error) {
         if (error instanceof RunCancelledError) {
             onEvent?.(

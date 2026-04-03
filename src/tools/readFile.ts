@@ -22,10 +22,10 @@ export const readFileTool: ToolDefinition = {
             throw new Error(String(context.signal.reason ?? "cancelled"));
         }
 
-        const path = args.path as string;
-        const resolvedPath = path.startsWith("/")
-            ? path
-            : `${context.cwd}/${path}`;
+        const targetPath = args.path as string;
+        const resolvedPath = targetPath.startsWith("/")
+            ? targetPath
+            : `${context.cwd}/${targetPath}`;
         const normalizedPath = resolvedPath.startsWith("/")
             ? resolvedPath
             : pathModuleResolve(context.cwd, resolvedPath);

@@ -1,5 +1,5 @@
 import { z } from "zod";
-import type { ToolPolicyMode } from "./tools/policy";
+import type { AgentMode, ToolPolicyMode } from "./tools/policy";
 import type { PermissionDecision } from "./tools/permissions";
 
 // Runtime roles for the conversation loop.
@@ -42,6 +42,8 @@ export type ToolAccessLevel = "read" | "write";
 export type ToolExecutionContext = {
     cwd: string;
     signal?: AbortSignal;
+    sessionId?: string;
+    agentMode?: AgentMode;
 };
 
 // ToolDefinition is owned by the runtime, not the model.
@@ -92,11 +94,18 @@ export type SessionState = {
     finalMessage?: string;
 };
 
+export type PlanApprovalDecision = "approve" | "reject";
+
 export type AgentEvent =
 | { type: "run_started"; prompt: string }
 | { type: "step_started"; step: number }
 | { type: "model_responded"; step: number; responseType: "message" | "tool_call" }
 | { type: "tool_requested"; toolName: string; args: Record<string, unknown> }
+| { type: "plan_mode_entered"; filePath: string }
+| { type: "plan_written"; filePath: string }
+| { type: "plan_approval_requested"; filePath: string; content: string }
+| { type: "plan_approval_resolved"; decision: PlanApprovalDecision }
+| { type: "plan_mode_exited"; filePath: string }
 | { type: "diff_preview_ready"; toolName: string; path: string; preview: string }
 | { type: "tool_started"; toolName: string }
 | { type: "tool_finished"; toolName: string; preview: string }
@@ -107,4 +116,20 @@ export type AgentEvent =
 | { type: "run_cancelled"; reason?: string }
 | { type: "run_failed"; error: string }
 | { type: "permission_requested"; toolName: string; accessLevel: ToolAccessLevel }
-| { type: "permission_resolved"; toolName: string; decision: PermissionDecision };
+| { type: "permission_resolved"; toolName: string; decision: PermissionDecision }
+// Agent Events
+| { type: "reasoning_summary_delta"; chunk: string }
+| { type: "reasoning_summary_completed"; content: string }
+| { type: "assistant_text_started" }
+| { type: "assistant_text_delta"; chunk: string }
+| { type: "assistant_text_completed"; content: string }
+| { type: "tool_call_detected"; toolName: string }
+| { type: "model_thinking_started" }
+| { type: "model_thinking_completed" }
+| {
+    type: "usage_updated";
+    model?: string;
+    inputTokens?: number;
+    outputTokens?: number;
+    totalTokens?: number;
+};

@@ -22,6 +22,21 @@ export function renderCliEvent(event: AgentEvent, state: SessionState): void {
         case "tool_requested":
             console.log(`Tool requested: ${event.toolName}`);
             break;
+        case "plan_mode_entered":
+            console.log(`Entered plan mode using ${event.filePath}`);
+            break;
+        case "plan_written":
+            console.log(`Plan written: ${event.filePath}`);
+            break;
+        case "plan_approval_requested":
+            console.log(`Plan approval requested: ${event.filePath}`);
+            break;
+        case "plan_approval_resolved":
+            console.log(`Plan ${event.decision}`);
+            break;
+        case "plan_mode_exited":
+            console.log(`Exited plan mode using ${event.filePath}`);
+            break;
         case "diff_preview_ready":
             console.log(`Patch preview for ${event.path}:\n${event.preview}`);
             break;
@@ -53,6 +68,9 @@ export function renderCliEvent(event: AgentEvent, state: SessionState): void {
             break;
         case "run_failed":
             console.log(`Run failed: ${event.error}`);
+            break;
+        case "run_cancelled":
+            console.log(`Run cancelled${event.reason ? `: ${event.reason}` : ""}`);
             break;
     }
 }

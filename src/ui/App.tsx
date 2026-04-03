@@ -1,14 +1,24 @@
-import React, { useCallback, useEffect, useMemo, useReducer, useRef, useState } from "react";
-import { Box, useApp, useInput, useStdin, useStdout } from "ink";
+import React, { useCallback, useEffect, useReducer, useRef, useState } from "react";
+import { randomUUID } from "node:crypto";
+import { Box, useApp, useInput, useStdin } from "ink";
 import { runAgent } from "../agent/runAgent";
 import { OpenAIClient, StubClient, type ModelClient } from "../llm/client";
 import { type PermissionDecision } from "../tools/permissions";
-import { type AgentEvent, type Message } from "../types";
+import { type AgentMode } from "../tools/policy";
+import { type AgentEvent, type Message, type PlanApprovalDecision } from "../types";
+import {
+    buildConversationFromCompactedContext,
+    compactConversationWithSummary,
+    formatCompactionSystemMessage,
+} from "../agent/compact";
+import { shouldAutoCompact, updateEstimatedContextTokens } from "../agent/contextBudget";
 import { Banner } from "./components/Banner";
+import { ContextMeter } from "./components/ContextMeter";
 import { DiffPreview } from "./components/DiffPreview";
 import { FinalAnswer } from "./components/FinalAnswer";
 import { InputBar } from "./components/InputBar";
 import { InlineRunStatus } from "./components/InlineRunStatus";
+import { PlanApprovalPrompt } from "./components/PlanApprovalPrompt";
 import { PermissionPrompt } from "./components/PermissionPrompt";
 import { Transcript } from "./components/Transcript";
 import { createInitialSessionState, sessionReducer } from "./state";
@@ -16,6 +26,16 @@ import { createInitialSessionState, sessionReducer } from "./state";
 type Props = {
     initialPrompt?: string;
 };
+
+const HELP_TEXT = [
+    "Available commands:",
+    "/plan - switch the session into plan mode",
+    "/execute - switch back to execute mode",
+    "/compact - compact older model context and keep a recent tail",
+    "/clear - clear the visible transcript",
+    "/help - show available commands",
+    "/quit - exit minicode",
+].join("\n");
 
 function createClient(): ModelClient {
     const apiKey = process.env.OPENAI_API_KEY;
@@ -30,20 +50,144 @@ function createClient(): ModelClient {
 export function App({ initialPrompt }: Props): React.ReactElement {
     const { exit } = useApp();
     const { isRawModeSupported } = useStdin();
-    const { stdout } = useStdout();
     const [state, dispatch] = useReducer(sessionReducer, undefined, createInitialSessionState);
-    const [transcriptScrollOffset, setTranscriptScrollOffset] = useState(0);
     const permissionResolverRef = useRef<((decision: PermissionDecision) => void) | null>(null);
+    const planApprovalResolverRef = useRef<((decision: PlanApprovalDecision) => void) | null>(null);
     const activeRunAbortRef = useRef<AbortController | null>(null);
     const clientRef = useRef<ModelClient>(createClient());
     const initialPromptSubmittedRef = useRef(false);
+    const sessionIdRef = useRef(randomUUID());
+    const [isCompacting, setIsCompacting] = useState(false);
 
     const handlePermissionDecision = useCallback((decision: PermissionDecision): void => {
         permissionResolverRef.current?.(decision);
         permissionResolverRef.current = null;
     }, []);
 
-    const startRun = useCallback(async (prompt: string, transcriptMessages: Message[]): Promise<void> => {
+    const handlePlanApprovalDecision = useCallback((decision: PlanApprovalDecision): void => {
+        planApprovalResolverRef.current?.(decision);
+        planApprovalResolverRef.current = null;
+    }, []);
+
+    const handleModeToggle = useCallback((): void => {
+        if (state.isRunning || state.activeRun.pendingPermission) {
+            return;
+        }
+
+        dispatch({
+            type: "mode_changed",
+            mode: state.mode === "execute" ? "plan" : "execute",
+        });
+    }, [state.activeRun.pendingPermission, state.isRunning, state.mode]);
+
+    /**
+     * The UI transcript contains more than the model should necessarily see:
+     * - streamed notes
+     * - tool feed rows
+     * - system status messages
+     *
+     * For model history we currently keep only the canonical user/assistant turns.
+     */
+    const getConversationMessages = useCallback((): Message[] => {
+        return state.conversationMessages;
+    }, [state.conversationMessages]);
+
+    const performCompaction = useCallback(async (conversationMessages: Message[]) => {
+        if (conversationMessages.length === 0 || isCompacting) {
+            return undefined;
+        }
+
+        setIsCompacting(true);
+        dispatch({
+            type: "system_message_added",
+            content: "Compacting context...",
+        });
+
+        try {
+            const compactedContext = await compactConversationWithSummary(
+                createClient(),
+                conversationMessages,
+                state.contextBudget,
+            );
+
+            dispatch({
+                type: "conversation_compacted",
+                compactedContext,
+                systemMessage: formatCompactionSystemMessage(compactedContext, state.contextBudget),
+            });
+            return compactedContext;
+        } finally {
+            setIsCompacting(false);
+        }
+    }, [isCompacting, state.contextBudget]);
+
+    const handleManualCompact = useCallback(async (): Promise<void> => {
+        const conversationMessages = getConversationMessages();
+
+        if (conversationMessages.length === 0) {
+            dispatch({
+                type: "system_message_added",
+                content: "Nothing to compact yet",
+            });
+            dispatch({ type: "input_changed", value: "" });
+            return;
+        }
+
+        dispatch({ type: "input_changed", value: "" });
+        await performCompaction(conversationMessages);
+    }, [getConversationMessages, performCompaction]);
+
+    const handleSlashCommand = useCallback(async (rawInput: string): Promise<boolean> => {
+        const trimmedInput = rawInput.trim();
+
+        if (!trimmedInput.startsWith("/")) {
+            return false;
+        }
+
+        const [command] = trimmedInput.slice(1).split(/\s+/, 1);
+
+        switch (command) {
+            case "plan":
+                if (state.mode === "plan") {
+                    dispatch({ type: "system_message_added", content: "Already in plan mode" });
+                } else {
+                    dispatch({ type: "mode_changed", mode: "plan" });
+                }
+                dispatch({ type: "input_changed", value: "" });
+                return true;
+            case "execute":
+                if (state.mode === "execute") {
+                    dispatch({ type: "system_message_added", content: "Already in execute mode" });
+                } else {
+                    dispatch({ type: "mode_changed", mode: "execute" });
+                }
+                dispatch({ type: "input_changed", value: "" });
+                return true;
+            case "clear":
+                dispatch({ type: "transcript_cleared" });
+                return true;
+            case "compact":
+                await handleManualCompact();
+                return true;
+            case "help":
+                dispatch({ type: "system_message_added", content: HELP_TEXT });
+                dispatch({ type: "input_changed", value: "" });
+                return true;
+            case "quit":
+            case "exit":
+                exit();
+                return true;
+            default:
+                dispatch({
+                    type: "system_message_added",
+                    content: `Unknown command: /${command}. Use /help to see available commands.`,
+                });
+                dispatch({ type: "input_changed", value: "" });
+                return true;
+        }
+    }, [dispatch, exit, handleManualCompact, state.mode]);
+
+    const startRun = useCallback(async (prompt: string, transcriptMessages: Message[], mode: AgentMode): Promise<void> => {
         dispatch({ type: "run_started" });
         const abortController = new AbortController();
         activeRunAbortRef.current = abortController;
@@ -56,13 +200,19 @@ export function App({ initialPrompt }: Props): React.ReactElement {
                     cwd: process.cwd(),
                     toolPolicyMode: "full",
                     signal: abortController.signal,
+                    mode,
+                    sessionId: sessionIdRef.current,
                 },
                 (event: AgentEvent) => {
                     dispatch({ type: "agent_event", event });
                 },
                 async () =>
                     new Promise<PermissionDecision>((resolve) => {
-                        permissionResolverRef.current = resolve;
+                    permissionResolverRef.current = resolve;
+                }),
+                async () =>
+                    new Promise<PlanApprovalDecision>((resolve) => {
+                        planApprovalResolverRef.current = resolve;
                     }),
             );
 
@@ -85,20 +235,43 @@ export function App({ initialPrompt }: Props): React.ReactElement {
         }
     }, []);
 
-    const submitPrompt = useCallback((prompt: string): void => {
+    const submitPrompt = useCallback(async (prompt: string, mode: AgentMode): Promise<void> => {
         const trimmedPrompt = prompt.trim();
 
-        if (!trimmedPrompt || state.isRunning || state.activeRun.pendingPermission) {
+        if (
+            !trimmedPrompt
+            || state.isRunning
+            || state.activeRun.pendingPermission
+            || state.activeRun.pendingPlanApproval
+            || isCompacting
+        ) {
             return;
         }
 
+        const liveConversationMessages = getConversationMessages();
+        const projectedConversation = [
+            ...liveConversationMessages,
+            {
+                role: "user" as const,
+                content: trimmedPrompt,
+            },
+        ];
+        const projectedBudget = updateEstimatedContextTokens(
+            state.contextBudget,
+            projectedConversation,
+        );
+
+        let conversationForRun = liveConversationMessages;
+
+        if (shouldAutoCompact(projectedBudget) && liveConversationMessages.length > 0) {
+            const compactedContext = await performCompaction(liveConversationMessages);
+            if (compactedContext) {
+                conversationForRun = buildConversationFromCompactedContext(compactedContext);
+            }
+        }
+
         const transcriptMessages: Message[] = [
-            ...state.transcript
-                .filter((entry) => entry.role !== "system")
-                .map<Message>((entry) => ({
-                    role: entry.role,
-                    content: entry.content,
-                })),
+            ...conversationForRun,
             {
                 role: "user",
                 content: trimmedPrompt,
@@ -106,31 +279,18 @@ export function App({ initialPrompt }: Props): React.ReactElement {
         ];
 
         dispatch({ type: "prompt_submitted", prompt: trimmedPrompt });
-        setTranscriptScrollOffset(0);
-        void startRun(trimmedPrompt, transcriptMessages);
-    }, [startRun, state.activeRun.pendingPermission, state.isRunning, state.transcript]);
-
-    const visibleTranscriptCount = useMemo(() => {
-        const terminalRows = stdout.rows ?? 24;
-        return Math.max(4, Math.floor((terminalRows - 10) / 2));
-    }, [stdout.rows]);
-
-    const maxTranscriptScrollOffset = Math.max(0, state.transcript.length - visibleTranscriptCount);
-    const clampedTranscriptScrollOffset = Math.min(transcriptScrollOffset, maxTranscriptScrollOffset);
-
-    const visibleTranscript = useMemo(() => {
-        if (state.transcript.length <= visibleTranscriptCount) {
-            return state.transcript;
-        }
-
-        const endIndex = state.transcript.length - clampedTranscriptScrollOffset;
-        const startIndex = Math.max(0, endIndex - visibleTranscriptCount);
-
-        return state.transcript.slice(startIndex, endIndex);
-    }, [clampedTranscriptScrollOffset, state.transcript, visibleTranscriptCount]);
-
-    const hiddenAboveCount = Math.max(0, state.transcript.length - visibleTranscript.length - clampedTranscriptScrollOffset);
-    const hiddenBelowCount = clampedTranscriptScrollOffset;
+        void startRun(trimmedPrompt, transcriptMessages, mode);
+    }, [
+        getConversationMessages,
+        isCompacting,
+        startRun,
+        state.activeRun.pendingPermission,
+        state.activeRun.pendingPlanApproval,
+        state.compactedContext,
+        state.contextBudget,
+        state.isRunning,
+        performCompaction,
+    ]);
 
     useInput((input, key) => {
         if (key.ctrl && input.toLowerCase() === "c") {
@@ -139,6 +299,11 @@ export function App({ initialPrompt }: Props): React.ReactElement {
         }
 
         if (key.escape) {
+            if (state.activeRun.pendingPlanApproval) {
+                handlePlanApprovalDecision("reject");
+                return;
+            }
+
             if (state.activeRun.pendingPermission) {
                 handlePermissionDecision("deny");
                 return;
@@ -153,42 +318,24 @@ export function App({ initialPrompt }: Props): React.ReactElement {
             return;
         }
 
-        if (key.upArrow) {
-            setTranscriptScrollOffset((current) => Math.min(maxTranscriptScrollOffset, current + 1));
+        if (state.activeRun.pendingPermission || state.activeRun.pendingPlanApproval || state.isRunning || isCompacting) {
             return;
         }
 
-        if (key.downArrow) {
-            setTranscriptScrollOffset((current) => Math.max(0, current - 1));
-            return;
-        }
-
-        if (key.pageUp) {
-            setTranscriptScrollOffset((current) => Math.min(maxTranscriptScrollOffset, current + 5));
-            return;
-        }
-
-        if (key.pageDown) {
-            setTranscriptScrollOffset((current) => Math.max(0, current - 5));
-            return;
-        }
-
-        if (key.home) {
-            setTranscriptScrollOffset(maxTranscriptScrollOffset);
-            return;
-        }
-
-        if (key.end) {
-            setTranscriptScrollOffset(0);
-            return;
-        }
-
-        if (state.activeRun.pendingPermission || state.isRunning) {
+        if (key.tab && key.shift) {
+            handleModeToggle();
             return;
         }
 
         if (key.return) {
-            submitPrompt(state.currentInput);
+            const trimmedInput = state.currentInput.trim();
+
+            if (trimmedInput.startsWith("/")) {
+                void handleSlashCommand(state.currentInput);
+                return;
+            }
+
+            void submitPrompt(state.currentInput, state.mode);
             return;
         }
 
@@ -207,7 +354,11 @@ export function App({ initialPrompt }: Props): React.ReactElement {
             });
         }
     }, {
-        isActive: isRawModeSupported && !state.activeRun.pendingPermission,
+        isActive:
+            isRawModeSupported
+            && !isCompacting
+            && !state.activeRun.pendingPermission
+            && !state.activeRun.pendingPlanApproval,
     });
 
     useEffect(() => {
@@ -215,6 +366,11 @@ export function App({ initialPrompt }: Props): React.ReactElement {
             if (permissionResolverRef.current) {
                 permissionResolverRef.current("deny");
                 permissionResolverRef.current = null;
+            }
+
+            if (planApprovalResolverRef.current) {
+                planApprovalResolverRef.current("reject");
+                planApprovalResolverRef.current = null;
             }
 
             activeRunAbortRef.current?.abort("shutdown");
@@ -228,35 +384,42 @@ export function App({ initialPrompt }: Props): React.ReactElement {
         }
 
         initialPromptSubmittedRef.current = true;
-        submitPrompt(initialPrompt);
-    }, [initialPrompt, submitPrompt]);
 
-    useEffect(() => {
-        if (transcriptScrollOffset > maxTranscriptScrollOffset) {
-            setTranscriptScrollOffset(maxTranscriptScrollOffset);
+        if (initialPrompt.trim().startsWith("/")) {
+            void handleSlashCommand(initialPrompt);
+            return;
         }
-    }, [maxTranscriptScrollOffset, transcriptScrollOffset]);
+
+        void submitPrompt(initialPrompt, "execute");
+    }, [handleSlashCommand, initialPrompt, submitPrompt]);
 
     return (
         <Box flexDirection="column">
             <Banner />
-            <Transcript
-                transcript={visibleTranscript}
-                hiddenAboveCount={hiddenAboveCount}
-                hiddenBelowCount={hiddenBelowCount}
-            />
+            <ContextMeter budget={state.contextBudget} compacted={Boolean(state.compactedContext)} />
+            <Transcript transcript={state.transcript} />
             <InlineRunStatus state={state.activeRun} />
             <DiffPreview diffPreview={state.activeRun.diffPreview} />
             <PermissionPrompt
                 pendingPermission={state.activeRun.pendingPermission}
                 onDecision={handlePermissionDecision}
             />
+            <PlanApprovalPrompt
+                pendingPlanApproval={state.activeRun.pendingPlanApproval}
+                onDecision={handlePlanApprovalDecision}
+            />
             <FinalAnswer
                 error={state.activeRun.error}
             />
             <InputBar
                 value={state.currentInput}
-                disabled={state.isRunning || Boolean(state.activeRun.pendingPermission)}
+                mode={state.mode}
+                disabled={
+                    state.isRunning
+                    || isCompacting
+                    || Boolean(state.activeRun.pendingPermission)
+                    || Boolean(state.activeRun.pendingPlanApproval)
+                }
             />
         </Box>
     );

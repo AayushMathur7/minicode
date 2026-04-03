@@ -3,7 +3,7 @@ import { stdin as input, stdout as output } from "node:process";
 import { runAgent } from "../agent/runAgent";
 import { OpenAIClient } from "../llm/openai";
 import { renderCliEvent } from "../renderers/cli";
-import { type Message } from "../types";
+import { type Message, type PlanApprovalDecision } from "../types";
 import { type PermissionDecision } from "../tools/permissions";
 
 async function requestPermission(params: {
@@ -20,6 +20,21 @@ async function requestPermission(params: {
         );
 
         return answer.trim().toLowerCase() === "y" ? "allow" : "deny";
+    } finally {
+        rl.close();
+    }
+}
+
+async function requestPlanApproval(params: {
+    filePath: string;
+    content: string;
+}): Promise<PlanApprovalDecision> {
+    const rl = createInterface({ input, output });
+
+    try {
+        console.log(`Plan ready for review: ${params.filePath}\n\n${params.content}\n`);
+        const answer = await rl.question("Approve this plan and exit plan mode? [y/N] ");
+        return answer.trim().toLowerCase() === "y" ? "approve" : "reject";
     } finally {
         rl.close();
     }
@@ -44,6 +59,7 @@ export async function main() {
             renderCliEvent(event, state);
         },
         requestPermission,
+        requestPlanApproval,
         
     );
 

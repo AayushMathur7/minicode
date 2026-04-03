@@ -1,9 +1,22 @@
 import { type Message } from "../types";
-import { SYSTEM_PROMPT } from "../agent/systemPrompt";
+import { type ToolPolicyMode, type AgentMode } from "../tools/policy";
+import { getSystemPrompt } from "../agent/systemPrompt";
 
-export function buildMessages(userMessages: Message[]): Message[] {
+export function buildMessages(
+    userMessages: Message[],
+    options: {
+        cwd?: string;
+        toolPolicyMode?: ToolPolicyMode;
+        agentMode?: AgentMode;
+        availableToolNames?: string[];
+        taskPrompt?: string;
+    } = {},
+): Message[] {
     return [
-        { role: "system", content: SYSTEM_PROMPT },
+        {
+            role: "system",
+            content: getSystemPrompt(options),
+        },
         ...userMessages,
     ];
 }

@@ -16,12 +16,14 @@
     "@types/react": "^19.2.14",
     "diff": "^8.0.4",
     "ink": "^6.8.0",
+    "marked": "^17.0.5",
     "minicode": "link:minicode",
     "openai": "^6.33.0",
     "react": "^19.2.4",
     "zod": "^4.3.6"
   },
   "scripts": {
+    "test": "bun test",
     "dev": "bun src/index.ts",
     "check": "tsc --noEmit",
     "tui": "bun src/entrypoints/tui.tsx"

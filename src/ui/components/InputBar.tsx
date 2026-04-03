@@ -1,12 +1,14 @@
 import React, { useEffect, useState } from "react";
 import { Box, Text } from "ink";
+import { type AgentMode } from "../../tools/policy";
 
 type Props = {
     value: string;
+    mode: AgentMode;
     disabled?: boolean;
 };
 
-export function InputBar({ value, disabled = false }: Props): React.ReactElement {
+export function InputBar({ value, mode, disabled = false }: Props): React.ReactElement {
     const [showCursor, setShowCursor] = useState(true);
 
     useEffect(() => {
@@ -27,6 +29,9 @@ export function InputBar({ value, disabled = false }: Props): React.ReactElement
     return (
         <Box marginTop={1}>
             <Text>
+                {mode === "plan" ? (
+                    <Text dimColor={true}>[plan] </Text>
+                ) : null}
                 <Text bold>{">"}</Text>{" "}
                 {disabled ? (
                     <Text dimColor={true}>working…</Text>

@@ -6,8 +6,6 @@ type Props = {
     state: ActiveRunState;
 };
 
-const SPINNER_FRAMES = ["⠋", "⠙", "⠸", "⠴", "⠦", "⠇"];
-
 function formatElapsed(startedAt: number): string {
     const elapsedSeconds = Math.max(0, Math.floor((Date.now() - startedAt) / 1000));
 
@@ -21,8 +19,64 @@ function formatElapsed(startedAt: number): string {
     return `${minutes}m ${seconds}s`;
 }
 
+function getAnimationFrames(inlineStatus: string | undefined): string[] {
+    if (!inlineStatus) {
+        return ["•"];
+    }
+
+    if (inlineStatus.startsWith("thinking")) {
+        return ["⠋", "⠙", "⠸", "⠴", "⠦", "⠇"];
+    }
+
+    if (inlineStatus.startsWith("writing")) {
+        return ["▌", "▐"];
+    }
+
+    if (inlineStatus.startsWith("preparing")) {
+        return ["→··", "·→·", "··→", "·→·"];
+    }
+
+    if (
+        inlineStatus.startsWith("running")
+        || inlineStatus.startsWith("reading")
+        || inlineStatus.startsWith("searching")
+        || inlineStatus.startsWith("reviewing")
+    ) {
+        return ["▮▯▯", "▯▮▯", "▯▯▮", "▯▮▯"];
+    }
+
+    return ["•"];
+}
+
+function getStatusColor(inlineStatus: string | undefined): "yellow" | "cyan" | "green" | "magenta" {
+    if (!inlineStatus) {
+        return "yellow";
+    }
+
+    if (inlineStatus.startsWith("thinking")) {
+        return "cyan";
+    }
+
+    if (inlineStatus.startsWith("writing")) {
+        return "magenta";
+    }
+
+    if (
+        inlineStatus.startsWith("running")
+        || inlineStatus.startsWith("reading")
+        || inlineStatus.startsWith("searching")
+        || inlineStatus.startsWith("preparing")
+        || inlineStatus.startsWith("reviewing")
+    ) {
+        return "green";
+    }
+
+    return "yellow";
+}
+
 export function InlineRunStatus({ state }: Props): React.ReactElement | null {
     const [frameIndex, setFrameIndex] = useState(0);
+    const frames = getAnimationFrames(state.inlineStatus);
 
     useEffect(() => {
         if (state.status !== "running") {
@@ -30,13 +84,13 @@ export function InlineRunStatus({ state }: Props): React.ReactElement | null {
         }
 
         const interval = setInterval(() => {
-            setFrameIndex((current) => (current + 1) % SPINNER_FRAMES.length);
+            setFrameIndex((current) => (current + 1) % frames.length);
         }, 120);
 
         return () => {
             clearInterval(interval);
         };
-    }, [state.status]);
+    }, [frames.length, state.status]);
 
     if (
         state.status === "idle" ||
@@ -47,19 +101,21 @@ export function InlineRunStatus({ state }: Props): React.ReactElement | null {
         return null;
     }
 
-    if (state.status === "awaiting_permission") {
+    if (state.status === "awaiting_permission" || state.status === "awaiting_plan_approval") {
         return (
             <Text color="yellow">
-                • {state.inlineStatus ?? "waiting for permission"}
+                • {state.inlineStatus ?? "waiting for input"}
             </Text>
         );
     }
 
     const elapsed = state.startedAt ? formatElapsed(state.startedAt) : undefined;
+    const color = getStatusColor(state.inlineStatus);
+    const frame = frames[frameIndex % frames.length] ?? "•";
 
     return (
-        <Text color="yellow">
-            {SPINNER_FRAMES[frameIndex]} {state.inlineStatus ?? "working"}
+        <Text color={color}>
+            {frame} {state.inlineStatus ?? "working"}
             {elapsed ? <Text dimColor={true}> ({elapsed})</Text> : null}
         </Text>
     );

@@ -30,7 +30,7 @@ type ApplyPatchArgs = {
  * - updatedContent: File content after performing the replacement.
  * - preview: A unified diff preview of the change for display/debug.
  */
-type PreparedPatch = {
+export type PreparedPatch = {
     resolvedPath: string;
     displayPath: string;
     updatedContent: string;
@@ -164,6 +164,18 @@ export async function prepareApplyPatch(
     };
 }
 
+export async function applyPreparedPatch(
+    preparedPatch: PreparedPatch,
+    context: ToolExecutionContext,
+): Promise<string> {
+    if (context.signal?.aborted) {
+        throw new Error(String(context.signal.reason ?? "cancelled"));
+    }
+
+    await fs.writeFile(preparedPatch.resolvedPath, preparedPatch.updatedContent, "utf8");
+    return `Applied patch to ${preparedPatch.resolvedPath}`;
+}
+
 /**
  * Tool definition exposed to the agent runtime. It writes the prepared patch to disk
  * and returns a short confirmation message upon success.
@@ -198,10 +210,6 @@ export const applyPatchTool: ToolDefinition = {
         }
 
         const preparedPatch = await prepareApplyPatch(args, context);
-        if (context.signal?.aborted) {
-            throw new Error(String(context.signal.reason ?? "cancelled"));
-        }
-        await fs.writeFile(preparedPatch.resolvedPath, preparedPatch.updatedContent, "utf8");
-        return `Applied patch to ${preparedPatch.resolvedPath}`;
+        return applyPreparedPatch(preparedPatch, context);
     },
 };
