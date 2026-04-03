@@ -22,19 +22,36 @@ import { PlanApprovalPrompt } from "./components/PlanApprovalPrompt";
 import { PermissionPrompt } from "./components/PermissionPrompt";
 import { Transcript } from "./components/Transcript";
 import { createInitialSessionState, sessionReducer } from "./state";
+import {
+    appendToSession,
+    appendToHistory,
+    listSessions,
+    loadHistory,
+    loadSessions,
+    searchSessions,
+    setSessionTitle,
+} from "../utils/sessionStorage";
+import { SlashCommandMenu, getMatchingCommands } from "./components/SlashCommandMenu";
+import { SessionPicker, type SessionPickerItem } from "./components/SessionPicker";
 
 type Props = {
     initialPrompt?: string;
+    resumeSessionId?: string;
 };
 
 const HELP_TEXT = [
     "Available commands:",
-    "/plan - switch the session into plan mode",
-    "/execute - switch back to execute mode",
-    "/compact - compact older model context and keep a recent tail",
-    "/clear - clear the visible transcript",
-    "/help - show available commands",
-    "/quit - exit minicode",
+    "/plan        - switch to plan mode",
+    "/execute     - switch to execute mode",
+    "/compact     - compact older context",
+    "/clear       - clear transcript and start new session",
+    "/sessions    - list previous sessions",
+    "/resume <n>  - resume a previous session",
+    "/search <q>  - search across all sessions",
+    "/help        - show this help",
+    "/quit        - exit minicode",
+    "",
+    "Up/Down arrows cycle through prompt history.",
 ].join("\n");
 
 function createClient(): ModelClient {
@@ -47,7 +64,19 @@ function createClient(): ModelClient {
     return new StubClient();
 }
 
-export function App({ initialPrompt }: Props): React.ReactElement {
+function formatTimeAgo(date: Date): string {
+    const seconds = Math.floor((Date.now() - date.getTime()) / 1000);
+    if (seconds < 60) return "just now";
+    const minutes = Math.floor(seconds / 60);
+    if (minutes < 60) return `${minutes}m ago`;
+    const hours = Math.floor(minutes / 60);
+    if (hours < 24) return `${hours}h ago`;
+    const days = Math.floor(hours / 24);
+    if (days === 1) return "yesterday";
+    return `${days}d ago`;
+}
+
+export function App({ initialPrompt, resumeSessionId }: Props): React.ReactElement {
     const { exit } = useApp();
     const { isRawModeSupported } = useStdin();
     const [state, dispatch] = useReducer(sessionReducer, undefined, createInitialSessionState);
@@ -59,6 +88,27 @@ export function App({ initialPrompt }: Props): React.ReactElement {
     const sessionIdRef = useRef(randomUUID());
     const [isCompacting, setIsCompacting] = useState(false);
     const [transcriptScrollOffset, setTranscriptScrollOffset] = useState(0);
+    const [slashMenuIndex, setSlashMenuIndex] = useState(0);
+
+    // Prompt history (up/down arrow to cycle)
+    const promptHistoryRef = useRef<string[]>(loadHistory());
+    const [historyIndex, setHistoryIndex] = useState(-1); // -1 = not browsing
+    const savedInputRef = useRef(""); // stash current input when entering history
+
+    // Session picker (interactive resume)
+    const [sessionPickerItems, setSessionPickerItems] = useState<SessionPickerItem[] | null>(null);
+    const [sessionPickerIndex, setSessionPickerIndex] = useState(0);
+
+    // Session title generation (once per session)
+    const titleGeneratedRef = useRef(false);
+
+    // Compute slash command menu state from current input
+    const showSlashMenu = !state.isRunning
+        && !isCompacting
+        && state.currentInput.startsWith("/")
+        && !state.currentInput.includes(" ");
+    const slashMatches = showSlashMenu ? getMatchingCommands(state.currentInput) : [];
+    const clampedMenuIndex = Math.min(slashMenuIndex, Math.max(0, slashMatches.length - 1));
     const terminalRows = process.stdout.rows ?? 24;
     const reservedRows =
         11
@@ -184,11 +234,55 @@ export function App({ initialPrompt }: Props): React.ReactElement {
                 dispatch({ type: "input_changed", value: "" });
                 return true;
             case "clear":
+                sessionIdRef.current = randomUUID();
                 dispatch({ type: "transcript_cleared" });
+                dispatch({ type: "system_message_added", content: "New session started." });
                 return true;
             case "compact":
                 await handleManualCompact();
                 return true;
+            case "sessions":
+            case "resume": {
+                const sessions = listSessions();
+                if (sessions.length === 0) {
+                    dispatch({ type: "system_message_added", content: "No previous sessions found." });
+                    dispatch({ type: "input_changed", value: "" });
+                    return true;
+                }
+                setSessionPickerItems(sessions);
+                setSessionPickerIndex(0);
+                dispatch({ type: "input_changed", value: "" });
+                return true;
+            }
+            case "search": {
+                const query = trimmedInput.slice("/search".length).trim();
+                if (!query) {
+                    dispatch({ type: "system_message_added", content: "Usage: /search <query>" });
+                    dispatch({ type: "input_changed", value: "" });
+                    return true;
+                }
+                const results = searchSessions(query);
+                if (results.length === 0) {
+                    dispatch({ type: "system_message_added", content: `No sessions found matching "${query}".` });
+                } else {
+                    const list = results
+                        .slice(0, 10)
+                        .map((r, i) => {
+                            const ago = formatTimeAgo(r.modified);
+                            const prompt = r.firstPrompt.length > 40
+                                ? r.firstPrompt.slice(0, 37) + "..."
+                                : r.firstPrompt;
+                            return `  ${i + 1}. ${prompt}  — ${ago}\n     match: ${r.matchingLine}`;
+                        })
+                        .join("\n");
+                    dispatch({
+                        type: "system_message_added",
+                        content: `Sessions matching "${query}":\n${list}`,
+                    });
+                }
+                dispatch({ type: "input_changed", value: "" });
+                return true;
+            }
             case "help":
                 dispatch({ type: "system_message_added", content: HELP_TEXT });
                 dispatch({ type: "input_changed", value: "" });
@@ -206,6 +300,27 @@ export function App({ initialPrompt }: Props): React.ReactElement {
                 return true;
         }
     }, [dispatch, exit, handleManualCompact, state.mode]);
+
+    const generateTitle = useCallback(async (userPrompt: string, assistantReply: string, sid: string) => {
+        try {
+            const titleClient = createClient();
+            const step = await titleClient.next({
+                messages: [
+                    { role: "system", content: "Generate a short title (max 6 words) for this conversation. Reply with ONLY the title, no quotes, no punctuation at the end." },
+                    { role: "user", content: userPrompt },
+                    { role: "assistant", content: assistantReply },
+                    { role: "user", content: "Title:" },
+                ],
+                tools: [],
+            });
+            if (step.type === "message") {
+                const title = step.message.content.trim().slice(0, 60);
+                setSessionTitle(sid, title);
+            }
+        } catch {
+            // Title generation is best-effort — don't crash the session
+        }
+    }, []);
 
     const startRun = useCallback(async (prompt: string, transcriptMessages: Message[], mode: AgentMode): Promise<void> => {
         dispatch({ type: "run_started" });
@@ -225,6 +340,21 @@ export function App({ initialPrompt }: Props): React.ReactElement {
                 },
                 (event: AgentEvent) => {
                     dispatch({ type: "agent_event", event });
+                    
+                    // Persist to disk                                                                                                                    
+                    if (event.type === "tool_requested") {
+                        appendToSession(sessionIdRef.current, {                                                                                           
+                            type: "tool_call",                            
+                            name: event.toolName,                                                                                                         
+                            args: event.args,
+                        });                                                                                                                               
+                    } else if (event.type === "tool_finished") {          
+                        appendToSession(sessionIdRef.current, {
+                            type: "tool_result",
+                            name: event.toolName,
+                            content: event.preview,                                                                                                       
+                        });
+                    }
                 },
                 async () =>
                     new Promise<PermissionDecision>((resolve) => {
@@ -237,7 +367,15 @@ export function App({ initialPrompt }: Props): React.ReactElement {
             );
 
             dispatch({ type: "assistant_message_added", content: message.content });
+            appendToSession(sessionIdRef.current, { type: "assistant", content: message.content });
+
             dispatch({ type: "run_completed" });
+
+            // Auto-generate a session title after the first exchange
+            if (!titleGeneratedRef.current) {
+                titleGeneratedRef.current = true;
+                void generateTitle(prompt, message.content, sessionIdRef.current);
+            }
         } catch (error) {
             if (abortController.signal.aborted) {
                 dispatch({ type: "run_cancelled" });
@@ -299,6 +437,11 @@ export function App({ initialPrompt }: Props): React.ReactElement {
         ];
 
         dispatch({ type: "prompt_submitted", prompt: trimmedPrompt });
+        appendToSession(sessionIdRef.current, { type: "user", content: trimmedPrompt });
+        appendToHistory(trimmedPrompt);
+        promptHistoryRef.current.push(trimmedPrompt);
+        setHistoryIndex(-1);
+
         setTranscriptScrollOffset(0);
         void startRun(trimmedPrompt, transcriptMessages, mode);
     }, [
@@ -335,17 +478,107 @@ export function App({ initialPrompt }: Props): React.ReactElement {
                 return;
             }
 
+            if (sessionPickerItems) {
+                setSessionPickerItems(null);
+                setSessionPickerIndex(0);
+                return;
+            }
+
             exit();
             return;
         }
 
+        // --- Session picker navigation ---
+        if (sessionPickerItems && sessionPickerItems.length > 0) {
+            if (key.upArrow) {
+                setSessionPickerIndex((i) => (i <= 0 ? sessionPickerItems.length - 1 : i - 1));
+                return;
+            }
+            if (key.downArrow) {
+                setSessionPickerIndex((i) => (i >= sessionPickerItems.length - 1 ? 0 : i + 1));
+                return;
+            }
+            if (key.return) {
+                const selected = sessionPickerItems[sessionPickerIndex];
+                if (selected) {
+                    const messages = loadSessions(selected.id);
+                    sessionIdRef.current = selected.id as ReturnType<typeof randomUUID>;
+                    dispatch({ type: "session_resumed", messages, sessionId: selected.id });
+                    setSessionPickerItems(null);
+                    setSessionPickerIndex(0);
+                }
+                return;
+            }
+            // Absorb all other keys while picker is open
+            return;
+        }
+
+        // --- Slash command menu navigation ---
+        if (showSlashMenu && slashMatches.length > 0) {
+            if (key.upArrow) {
+                setSlashMenuIndex((i) => (i <= 0 ? slashMatches.length - 1 : i - 1));
+                return;
+            }
+            if (key.downArrow) {
+                setSlashMenuIndex((i) => (i >= slashMatches.length - 1 ? 0 : i + 1));
+                return;
+            }
+            if (key.tab) {
+                // Autocomplete the selected command
+                const selected = slashMatches[clampedMenuIndex];
+                if (selected) {
+                    dispatch({ type: "input_changed", value: `/${selected.name} ` });
+                    setSlashMenuIndex(0);
+                }
+                return;
+            }
+            if (key.return) {
+                // Run the selected command
+                const selected = slashMatches[clampedMenuIndex];
+                if (selected) {
+                    void handleSlashCommand(`/${selected.name}`);
+                    setSlashMenuIndex(0);
+                }
+                return;
+            }
+        }
+
+        // --- Prompt history (when idle) or transcript scrolling (when running) ---
         if (key.upArrow) {
-            setTranscriptScrollOffset((current) => Math.min(maxTranscriptScrollOffset, current + 1));
+            if (!state.isRunning && promptHistoryRef.current.length > 0) {
+                const history = promptHistoryRef.current;
+                if (historyIndex === -1) {
+                    // Entering history — save current input
+                    savedInputRef.current = state.currentInput;
+                    const newIndex = history.length - 1;
+                    setHistoryIndex(newIndex);
+                    dispatch({ type: "input_changed", value: history[newIndex]! });
+                } else if (historyIndex > 0) {
+                    const newIndex = historyIndex - 1;
+                    setHistoryIndex(newIndex);
+                    dispatch({ type: "input_changed", value: history[newIndex]! });
+                }
+            } else {
+                setTranscriptScrollOffset((current) => Math.min(maxTranscriptScrollOffset, current + 1));
+            }
             return;
         }
 
         if (key.downArrow) {
-            setTranscriptScrollOffset((current) => Math.max(0, current - 1));
+            if (!state.isRunning && historyIndex !== -1) {
+                const history = promptHistoryRef.current;
+                if (historyIndex < history.length - 1) {
+                    const newIndex = historyIndex + 1;
+                    setHistoryIndex(newIndex);
+                    dispatch({ type: "input_changed", value: history[newIndex]! });
+                } else {
+                    // Past the end — restore saved input
+                    setHistoryIndex(-1);
+                    dispatch({ type: "input_changed", value: savedInputRef.current });
+                }
+            } else {
+                setTranscriptScrollOffset((current) => Math.max(0, current - 1));
+            }
             return;
         }
 
@@ -399,6 +632,7 @@ export function App({ initialPrompt }: Props): React.ReactElement {
                 type: "input_changed",
                 value: state.currentInput.slice(0, -1),
             });
+            setSlashMenuIndex(0);
             return;
         }
 
@@ -407,6 +641,7 @@ export function App({ initialPrompt }: Props): React.ReactElement {
                 type: "input_changed",
                 value: `${state.currentInput}${input}`,
             });
+            setSlashMenuIndex(0);
         }
     }, {
         isActive:
@@ -436,6 +671,29 @@ export function App({ initialPrompt }: Props): React.ReactElement {
             activeRunAbortRef.current = null;
         };
     }, []);
+
+    // Resume session from --resume flag
+    const resumeHandledRef = useRef(false);
+    useEffect(() => {
+        if (!resumeSessionId || resumeHandledRef.current) return;
+        resumeHandledRef.current = true;
+
+        if (resumeSessionId === "last") {
+            const sessions = listSessions();
+            if (sessions.length > 0) {
+                const last = sessions[0]!;
+                const messages = loadSessions(last.id);
+                sessionIdRef.current = last.id as ReturnType<typeof randomUUID>;
+                dispatch({ type: "session_resumed", messages, sessionId: last.id });
+                titleGeneratedRef.current = true; // already has a title
+            }
+        } else {
+            const messages = loadSessions(resumeSessionId);
+            sessionIdRef.current = resumeSessionId as ReturnType<typeof randomUUID>;
+            dispatch({ type: "session_resumed", messages, sessionId: resumeSessionId });
+            titleGeneratedRef.current = true;
+        }
+    }, [resumeSessionId]);
 
     useEffect(() => {
         if (!initialPrompt || initialPromptSubmittedRef.current) {
@@ -474,6 +732,19 @@ export function App({ initialPrompt }: Props): React.ReactElement {
             <FinalAnswer
                 error={state.activeRun.error}
             />
+            {showSlashMenu && slashMatches.length > 0 && (
+                <SlashCommandMenu
+                    matches={slashMatches}
+                    selectedIndex={clampedMenuIndex}
+                />
+            )}
+            {sessionPickerItems && sessionPickerItems.length > 0 && (
+                <SessionPicker
+                    sessions={sessionPickerItems}
+                    selectedIndex={sessionPickerIndex}
+                    formatTimeAgo={formatTimeAgo}
+                />
+            )}
             <InputBar
                 value={state.currentInput}
                 mode={state.mode}
@@ -482,6 +753,7 @@ export function App({ initialPrompt }: Props): React.ReactElement {
                     || isCompacting
                     || Boolean(state.activeRun.pendingPermission)
                     || Boolean(state.activeRun.pendingPlanApproval)
+                    || Boolean(sessionPickerItems)
                 }
             />
         </Box>

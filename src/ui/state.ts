@@ -87,6 +87,7 @@ export type SessionAction =
     | { type: "conversation_compacted"; compactedContext: CompactedContextState; systemMessage: string }
     | { type: "context_budget_recomputed"; messages: Message[] }
     | { type: "agent_event"; event: AgentEvent }
+    | { type: "session_resumed"; messages: Message[]; sessionId: string }
     | { type: "run_started" }
     | { type: "run_completed" }
     | { type: "run_cancelled" }
@@ -667,6 +668,43 @@ export function sessionReducer(
                 contextBudget: createInitialContextBudget(state.contextBudget.config),
                 activeRun: createEmptyRunState(state.mode),
             };
+        case "session_resumed":
+            {
+                // Rebuild transcript entries from the loaded messages so the user
+                // can see the previous conversation.
+                const resumedTranscript: TranscriptEntry[] = action.messages.map(
+                    (msg, idx) => ({
+                        id: idx,
+                        role: msg.role === "tool" ? ("tool_result" as const) : (msg.role as "user" | "assistant"),
+                        content: msg.content,
+                        toolName: msg.name,
+                    }),
+                );
+                const nextId = resumedTranscript.length;
+
+                return {
+                    ...state,
+                    transcript: [
+                        ...resumedTranscript,
+                        {
+                            id: nextId,
+                            role: "system",
+                            content: `Session resumed (${action.sessionId.slice(0, 8)}...)`,
+                        },
+                    ],
+                    conversationMessages: action.messages,
+                    nextTranscriptId: nextId + 1,
+                    streamingAssistantEntryId: undefined,
+                    streamingReasoningEntryId: undefined,
+                    currentInput: "",
+                    compactedContext: undefined,
+                    contextBudget: recomputeBudgetFromConversation(
+                        createInitialContextBudget(state.contextBudget.config),
+                        action.messages,
+                    ),
+                    activeRun: createEmptyRunState(state.mode),
+                };
+            }
         case "conversation_compacted":
             {
                 const compactedConversationMessages = [
