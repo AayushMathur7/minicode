@@ -6,6 +6,9 @@ import { OpenAIClient, StubClient, type ModelClient } from "../llm/client";
 import { type PermissionDecision } from "../tools/permissions";
 import { type AgentMode } from "../tools/policy";
 import { type AgentEvent, type Message, type PlanApprovalDecision } from "../types";
+import { initAgentTool } from "../tools/agentTool";
+import { allTools } from "../tools";
+import { drainNotifications, formatNotification } from "../agent/notificationQueue";
 import {
     buildConversationFromCompactedContext,
     compactConversationWithSummary,
@@ -86,6 +89,44 @@ export function App({ initialPrompt, resumeSessionId }: Props): React.ReactEleme
     const clientRef = useRef<ModelClient>(createClient());
     const initialPromptSubmittedRef = useRef(false);
     const sessionIdRef = useRef(randomUUID());
+
+    // Give the agent tool access to the shared ModelClient and full tool list.
+    // This runs once on mount (clientRef is stable).
+    useEffect(() => {
+        initAgentTool(clientRef.current, allTools, (event) => {
+            switch (event.type) {
+                case "subagent_started": {
+                    const label = event.background
+                        ? `agent:${event.agentType} (background)`
+                        : `agent:${event.agentType}`;
+                    dispatch({
+                        type: "agent_event",
+                        event: { type: "tool_started", toolName: label },
+                    });
+                    break;
+                }
+                case "subagent_tool_used":
+                    dispatch({
+                        type: "agent_event",
+                        event: {
+                            type: "tool_started",
+                            toolName: `agent:${event.agentType} → ${event.toolName}`,
+                        },
+                    });
+                    break;
+                case "subagent_finished":
+                    dispatch({
+                        type: "agent_event",
+                        event: {
+                            type: "tool_finished",
+                            toolName: `agent:${event.agentType}`,
+                            preview: `${event.toolUseCount} tool uses`,
+                        },
+                    });
+                    break;
+            }
+        });
+    }, []);
     const [isCompacting, setIsCompacting] = useState(false);
     const [transcriptScrollOffset, setTranscriptScrollOffset] = useState(0);
     const [slashMenuIndex, setSlashMenuIndex] = useState(0);
@@ -375,6 +416,37 @@ export function App({ initialPrompt, resumeSessionId }: Props): React.ReactEleme
             if (!titleGeneratedRef.current) {
                 titleGeneratedRef.current = true;
                 void generateTitle(prompt, message.content, sessionIdRef.current);
+            }
+
+            // --- Auto-drain background agent notifications ---
+            // If any background sub-agents completed while the main loop was
+            // running (or just after it finished), inject their results as a
+            // new conversation turn so the model can see them.
+            // This mirrors Claude Code's useQueueProcessor: when the main
+            // query finishes and the REPL is idle, check the queue and
+            // auto-submit any pending notifications.
+            const pending = drainNotifications();
+            if (pending.length > 0) {
+                const notificationText = pending
+                    .map(formatNotification)
+                    .join("\n\n---\n\n");
+
+                const notificationMessages: Message[] = [
+                    ...transcriptMessages,
+                    { role: "assistant", content: message.content },
+                    { role: "user", content: notificationText },
+                ];
+
+                dispatch({
+                    type: "system_message_added",
+                    content: `${pending.length} background agent(s) completed — processing results...`,
+                });
+
+                // Start a new agent turn with the notification injected.
+                // This is fire-and-forget; it re-enters startRun which will
+                // itself check for more notifications when it finishes
+                // (handles cascading completions).
+                void startRun(notificationText, notificationMessages, mode);
             }
         } catch (error) {
             if (abortController.signal.aborted) {

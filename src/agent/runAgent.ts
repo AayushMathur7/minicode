@@ -15,6 +15,8 @@ import {
 } from "./session";
 import type { PermissionDecision } from "../tools/permissions";
 import { loadHookConfig, runHooks } from "../utils/hook";
+import { drainNotifications, formatNotification } from "./notificationQueue";
+export { drainNotifications, formatNotification } from "./notificationQueue";
 
 class RunCancelledError extends Error {
     constructor(message: string) {
@@ -156,6 +158,27 @@ export async function runAgent(
             onEvent?.({ type: "step_started", step: steps }, sessionState);
 
             throwIfAborted(options.signal);
+
+            // --- Drain background agent notifications ---
+            // If any background sub-agents have completed since the last turn,
+            // inject their results into the conversation so the model can see them.
+            for (const notification of drainNotifications()) {
+                const notificationText = formatNotification(notification);
+                messages.push({
+                    role: "user",
+                    content: notificationText,
+                });
+                onEvent?.(
+                    {
+                        type: "tool_finished",
+                        toolName: `agent:${notification.agentType}`,
+                        preview: notification.status === "completed"
+                            ? `${notification.toolUseCount} tool uses, ${(notification.durationMs / 1000).toFixed(1)}s`
+                            : `failed: ${notification.error ?? "unknown"}`,
+                    },
+                    sessionState,
+                );
+            }
 
             // Ask the model what to do next given the current conversation and tool list.
             const step: AgentStep = await client.next({

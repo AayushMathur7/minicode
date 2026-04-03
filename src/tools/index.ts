@@ -1,4 +1,5 @@
 import { type ToolDefinition } from "../types";
+import { agentTool } from "./agentTool";
 import { applyPatchTool } from "./applyPatch";
 import { enterPlanModeTool } from "./enterPlanMode";
 import { exitPlanModeTool } from "./exitPlanMode";
@@ -15,6 +16,7 @@ import { writeFileTool } from "./writeFile";
 import { filterToolsByPolicy, type ToolPolicyMode } from "./policy";
 
 export const allTools: ToolDefinition[] = [
+    agentTool,
     enterPlanModeTool,
     listFilesTool,
     readFileTool,

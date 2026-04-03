@@ -187,6 +187,13 @@ function describeToolRequest(
         return command ? `running ${command}` : "running command";
     }
 
+    if (toolName === "agent") {
+        const agentType = typeof args.agent_type === "string" ? args.agent_type : "explore";
+        const prompt = typeof args.prompt === "string" ? args.prompt : "";
+        const shortPrompt = prompt.length > 60 ? `${prompt.slice(0, 57)}...` : prompt;
+        return `delegating to ${agentType} agent: ${shortPrompt}`;
+    }
+
     return `using ${toolName}`;
 }
 

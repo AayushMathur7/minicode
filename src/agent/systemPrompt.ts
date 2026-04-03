@@ -25,6 +25,16 @@ function getToolUsageSection(): string {
     ].join(" ");
 }
 
+function getSubagentSection(): string {
+    return [
+        "You can delegate self-contained tasks to a sub-agent using the agent tool.",
+        'Use agent_type "explore" for read-only codebase search (finding files, understanding code structure, answering questions about the repo).',
+        'Use agent_type "general" for tasks that require reading AND writing (code changes, running tests, multi-step work).',
+        "The sub-agent runs with its own conversation — it cannot see your history. Give it a clear, specific prompt with all the context it needs.",
+        "Use sub-agents when the task is independent and doesn't require back-and-forth with you. Prefer doing it yourself for quick, targeted operations.",
+    ].join(" ");
+}
+
 function getEditingSection(): string {
     return [
         "Prefer apply_patch for targeted edits. Use write_file only when replacing or creating a full file is truly necessary.",
@@ -117,6 +127,9 @@ export function getSystemPrompt(options: SystemPromptOptions = {}): string {
             getTaskStrategySection(options.taskPrompt),
         ),
         systemPromptSection("tool_usage", getToolUsageSection),
+        dynamicSystemPromptSection("subagents", () =>
+            agentMode === "execute" ? getSubagentSection() : null,
+        ),
         dynamicSystemPromptSection("plan_workflow", () =>
             agentMode === "plan" ? getPlanWorkflowSection() : null,
         ),
