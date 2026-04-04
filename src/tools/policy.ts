@@ -3,9 +3,13 @@ import { type ToolDefinition } from "../types";
 
 export type ToolPolicyMode = "safe" | "full";
 const SAFE_MODE_ALLOWED_WRITE_TOOLS = new Set(["write_plan"]);
-const PLAN_MODE_ALLOWED_WRITE_TOOLS = new Set(["write_plan"]);
-const PLAN_MODE_ALLOWED_READ_TOOLS = new Set(["exit_plan_mode"]);
-const EXECUTE_MODE_HIDDEN_TOOLS = new Set(["write_plan", "exit_plan_mode"]);
+
+// Tools that only make sense in plan mode — hidden from execute mode.
+const PLAN_ONLY_TOOLS = new Set(["write_plan", "exit_plan_mode"]);
+
+// Write tools that ARE allowed in plan mode (plan-specific writes).
+// Every other write tool is visible but gated at execution time.
+const PLAN_MODE_ALLOWED_WRITES = new Set(["write_plan", "exit_plan_mode"]);
 
 // ---------------------------------------------------------------------------
 // Subagent tool restrictions
@@ -43,20 +47,46 @@ export function filterToolsByPolicy(
 
 export type AgentMode = "execute" | "plan";
 
+/**
+ * Filter tools by agent mode.
+ *
+ * Claude Code's approach: the model sees ALL tools in every mode.
+ * The mode only controls what happens at execution time (gating),
+ * not what tools are visible. This lets the model plan around tools
+ * it knows it'll have access to after exiting plan mode.
+ *
+ * Exception: plan-only tools (write_plan, exit_plan_mode) are hidden
+ * in execute mode since they're meaningless outside plan mode.
+ */
 export function filterToolsByMode(
     tools: ToolDefinition[],
     mode: AgentMode,
 ) : ToolDefinition[] {
     if (mode === "execute") {
-        return tools.filter((tool) => !EXECUTE_MODE_HIDDEN_TOOLS.has(tool.name));
+        return tools.filter((tool) => !PLAN_ONLY_TOOLS.has(tool.name));
     }
 
-    return tools.filter(
-        (tool) =>
-            tool.accessLevel === "read"
-            || PLAN_MODE_ALLOWED_WRITE_TOOLS.has(tool.name)
-            || PLAN_MODE_ALLOWED_READ_TOOLS.has(tool.name),
-    );
+    // Plan mode: show everything (writes are gated at execution time in runAgent)
+    return tools;
+}
+
+/**
+ * Check if a tool call should be blocked in plan mode.
+ * Returns a reason string if blocked, null if allowed.
+ *
+ * Write tools are blocked UNLESS they're plan-specific (write_plan, exit_plan_mode).
+ * Read tools always pass. This is checked at execution time, not at tool visibility time.
+ */
+export function getPlanModeBlock(
+    toolName: string,
+    accessLevel: "read" | "write",
+    mode: AgentMode,
+): string | null {
+    if (mode !== "plan") return null;
+    if (accessLevel === "read") return null;
+    if (PLAN_MODE_ALLOWED_WRITES.has(toolName)) return null;
+
+    return `Tool "${toolName}" is blocked in plan mode. You can see all available tools, but write operations are not allowed until you exit plan mode. Use write_plan to save your plan, then call exit_plan_mode to get approval before making changes.`;
 }
 
 export function getToolsForRuntime(

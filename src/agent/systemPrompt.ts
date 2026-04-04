@@ -50,9 +50,10 @@ function getVerificationSection(): string {
 
 function getPlanWorkflowSection(): string {
     return [
-        "In plan mode, do not edit repository files or propose direct implementation changes yet.",
-        "Explore the codebase, identify the relevant files and patterns, then save the plan with write_plan.",
-        "Once the plan file is ready, call exit_plan_mode to present it for approval before any implementation work begins.",
+        "You are in plan mode. All tools are visible so you can plan around them, but write operations (write_file, apply_patch, run_command) are blocked until you exit plan mode.",
+        "Use read tools to explore the codebase and understand the relevant files and patterns.",
+        "Save your plan with write_plan, then call exit_plan_mode to present it for approval.",
+        "After approval, you will enter execute mode where all write tools become available.",
     ].join(" ");
 }
 
@@ -75,14 +76,14 @@ function isBroadPerformancePrompt(prompt: string): boolean {
 function getDynamicSessionContext({
     cwd,
     toolPolicyMode,
-    availableToolNames,
 }: SystemPromptOptions): string {
     const parts = [
         cwd ? `Current working directory: ${cwd}` : null,
         toolPolicyMode ? `Tool policy mode: ${toolPolicyMode}` : null,
-        availableToolNames && availableToolNames.length > 0
-            ? `Visible tools: ${availableToolNames.join(", ")}`
-            : null,
+        // NOTE: We intentionally do NOT list tool names here.
+        // Tools are already sent via the API's `tools` parameter — repeating
+        // them in the system prompt wastes tokens and busts the cache when
+        // mode switches change the visible tool set.
     ].filter((part): part is string => part !== null);
 
     return parts.join("\n");
@@ -121,15 +122,29 @@ function getTaskStrategySection(taskPrompt: string | undefined): string | null {
 
 export function getSystemPrompt(options: SystemPromptOptions = {}): string {
     const agentMode = options.agentMode ?? "execute";
+    // Sections are ordered for prompt cache stability:
+    // STATIC sections first (identical across turns and runs) → maximizes
+    // the cacheable prefix. DYNAMIC sections last (change per-turn or
+    // per-mode) → changes only affect the tail, not the cached prefix.
     return resolveSystemPromptSections([
+        // --- STATIC: never change between turns ---
         systemPromptSection("core_identity", getCoreIdentitySection),
-        dynamicSystemPromptSection("agent_mode", () => getModeSection(agentMode)),
-        dynamicSystemPromptSection("task_strategy", () =>
-            getTaskStrategySection(options.taskPrompt),
-        ),
         systemPromptSection("tool_usage", getToolUsageSection),
+        systemPromptSection("efficiency", getEfficiencySection),
+
+        // --- SEMI-STATIC: change on mode switch, stable within a mode ---
+        dynamicSystemPromptSection("agent_mode", () => getModeSection(agentMode)),
         dynamicSystemPromptSection("subagents", () =>
             agentMode === "execute" ? getSubagentSection() : null,
+        ),
+        dynamicSystemPromptSection("editing", () =>
+            agentMode === "execute" ? getEditingSection() : null,
+        ),
+        dynamicSystemPromptSection("verification", () =>
+            agentMode === "execute" ? getVerificationSection() : null,
+        ),
+        dynamicSystemPromptSection("plan_workflow", () =>
+            agentMode === "plan" ? getPlanWorkflowSection() : null,
         ),
         dynamicSystemPromptSection("skills", () => {
             const cwd = options.cwd ?? process.cwd();
@@ -142,16 +157,11 @@ export function getSystemPrompt(options: SystemPromptOptions = {}): string {
                 listing,
             ].join("\n");
         }),
-        dynamicSystemPromptSection("plan_workflow", () =>
-            agentMode === "plan" ? getPlanWorkflowSection() : null,
+
+        // --- DYNAMIC: changes per prompt ---
+        dynamicSystemPromptSection("task_strategy", () =>
+            getTaskStrategySection(options.taskPrompt),
         ),
-        dynamicSystemPromptSection("editing", () =>
-            agentMode === "execute" ? getEditingSection() : null,
-        ),
-        dynamicSystemPromptSection("verification", () =>
-            agentMode === "execute" ? getVerificationSection() : null,
-        ),
-        systemPromptSection("efficiency", getEfficiencySection),
         dynamicSystemPromptSection("session_context", () =>
             getDynamicSessionContext(options),
         ),

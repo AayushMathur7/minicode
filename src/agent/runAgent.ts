@@ -5,7 +5,7 @@ import { applyPreparedPatch, type PreparedPatch, prepareApplyPatch } from "../to
 import { getPlanArtifact, preparePlanApproval, type PreparedPlanApproval } from "./plans";
 import { getSystemPrompt } from "./systemPrompt";
 import { type AgentEvent, type AgentStep, type Message, type PlanApprovalDecision, type SessionState, type ToolAccessLevel, type ToolDefinition, type ToolExecutionContext, type ToolMetadata } from "../types";
-import { type AgentMode, type ToolPolicyMode, getToolsForRuntime } from "../tools/policy";
+import { type AgentMode, type ToolPolicyMode, getToolsForRuntime, getPlanModeBlock } from "../tools/policy";
 import {
     createSessionState,
     recordFinalMessage,
@@ -514,6 +514,26 @@ export async function runAgent(
                 messages.push({
                     role: "assistant",
                     content: `Tool ${step.call.toolName} not found`,
+                });
+                continue;
+            }
+
+            // --- Plan mode gate ---
+            // All tools are visible to the model, but write tools (except
+            // write_plan and exit_plan_mode) are blocked at execution time
+            // in plan mode. This matches Claude Code's approach: the model
+            // knows what tools exist and can plan around them, but can't
+            // use writes until it exits plan mode.
+            const planBlock = getPlanModeBlock(tool.name, tool.accessLevel, agentMode);
+            if (planBlock) {
+                onEvent?.(
+                    { type: "tool_failed", toolName: step.call.toolName, error: "blocked by plan mode" },
+                    sessionState,
+                );
+                messages.push({
+                    role: "tool",
+                    name: tool.name,
+                    content: planBlock,
                 });
                 continue;
             }
