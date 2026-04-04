@@ -13,10 +13,12 @@ import { runTypecheckTool } from "./runTypecheck";
 import { searchCodeTool } from "./searchCode";
 import { writePlanTool } from "./writePlan";
 import { writeFileTool } from "./writeFile";
+import { skillTool } from "./skillTool";
 import { filterToolsByPolicy, type ToolPolicyMode } from "./policy";
 
 export const allTools: ToolDefinition[] = [
     agentTool,
+    skillTool,
     enterPlanModeTool,
     listFilesTool,
     readFileTool,

@@ -1,4 +1,5 @@
 import { type ToolPolicyMode, type AgentMode } from "../tools/policy";
+import { getSkillListForPrompt } from "../tools/skillTool";
 import {
     dynamicSystemPromptSection,
     resolveSystemPromptSections,
@@ -130,6 +131,17 @@ export function getSystemPrompt(options: SystemPromptOptions = {}): string {
         dynamicSystemPromptSection("subagents", () =>
             agentMode === "execute" ? getSubagentSection() : null,
         ),
+        dynamicSystemPromptSection("skills", () => {
+            const cwd = options.cwd ?? process.cwd();
+            const listing = getSkillListForPrompt(cwd);
+            if (!listing) return null;
+            return [
+                "The following skills are available. When a user's request matches a skill, invoke it with the skill tool BEFORE doing anything else.",
+                'When users reference "/skill-name", they mean a skill. Invoke it.',
+                "",
+                listing,
+            ].join("\n");
+        }),
         dynamicSystemPromptSection("plan_workflow", () =>
             agentMode === "plan" ? getPlanWorkflowSection() : null,
         ),

@@ -40,6 +40,119 @@ function getToolCallSignature(
     return `${toolName}:${JSON.stringify(args)}`;
 }
 
+// ---------------------------------------------------------------------------
+// Path-aware concurrency helpers
+// ---------------------------------------------------------------------------
+
+type PendingCall = { toolName: string; args: Record<string, unknown>; tool: ToolDefinition };
+
+/**
+ * Extract the file path(s) a tool call will touch.
+ * Returns null if we can't determine the path (conservative = serialize).
+ */
+function getTargetPaths(
+    call: PendingCall,
+    cwd: string,
+): string[] | null {
+    const pathArg = call.args.path ?? call.args.file_path;
+    if (typeof pathArg === "string") {
+        // Tools like read_file, write_file, apply_patch, get_file_outline
+        const resolved = pathArg.startsWith("/") ? pathArg : `${cwd}/${pathArg}`;
+        return [resolved];
+    }
+
+    // search_code, list_files — operate on the whole workspace but are read-only.
+    // They don't conflict with anything.
+    if (call.tool.accessLevel === "read") {
+        return [];  // empty = "no specific file" = never conflicts
+    }
+
+    // run_command, agent, etc. — unknown side effects, can't parallelize
+    return null;
+}
+
+/**
+ * Check if two tool calls conflict (touch the same file with at least one write).
+ *
+ * Rules:
+ *   - Two reads on the same file → no conflict (safe)
+ *   - Read + write on the same file → conflict
+ *   - Write + write on the same file → conflict
+ *   - Unknown path (null) on a write → conflicts with everything
+ *   - Empty paths (workspace-wide reads) → never conflict
+ */
+function callsConflict(
+    a: PendingCall,
+    aPaths: string[] | null,
+    b: PendingCall,
+    bPaths: string[] | null,
+): boolean {
+    // Two reads never conflict, even on the same file
+    if (a.tool.accessLevel === "read" && b.tool.accessLevel === "read") {
+        return false;
+    }
+
+    // If either has unknown paths and is a write, conflict conservatively
+    if (aPaths === null || bPaths === null) {
+        return true;
+    }
+
+    // Empty paths (workspace-wide reads like search_code) never conflict
+    if (aPaths.length === 0 || bPaths.length === 0) {
+        return false;
+    }
+
+    // Check for overlapping paths
+    const aSet = new Set(aPaths);
+    return bPaths.some(p => aSet.has(p));
+}
+
+/**
+ * Partition a batch of tool calls into sequential groups where calls within
+ * each group can safely run in parallel (no path conflicts).
+ *
+ * Algorithm: greedy coloring. For each call, try to add it to the last group.
+ * If it conflicts with anything in that group, start a new group.
+ *
+ * Example:
+ *   [write(a.ts), write(b.ts), write(a.ts), read(c.ts)]
+ *   → Group 1: [write(a.ts), write(b.ts), read(c.ts)]  ← no conflicts
+ *   → Group 2: [write(a.ts)]                            ← conflicts with group 1's a.ts
+ */
+function buildParallelGroups(
+    batch: PendingCall[],
+    cwd: string,
+): PendingCall[][] {
+    const groups: { calls: PendingCall[]; paths: Array<{ call: PendingCall; paths: string[] | null }> }[] = [];
+
+    for (const call of batch) {
+        const paths = getTargetPaths(call, cwd);
+        let placed = false;
+
+        // Try to fit into the current (last) group
+        if (groups.length > 0) {
+            const lastGroup = groups[groups.length - 1]!;
+            const conflicts = lastGroup.paths.some(
+                existing => callsConflict(existing.call, existing.paths, call, paths),
+            );
+            if (!conflicts) {
+                lastGroup.calls.push(call);
+                lastGroup.paths.push({ call, paths });
+                placed = true;
+            }
+        }
+
+        if (!placed) {
+            groups.push({
+                calls: [call],
+                paths: [{ call, paths }],
+            });
+        }
+    }
+
+    return groups.map(g => g.calls);
+}
+
 /**
  * Runs the main agent loop until the model returns a final message
  * or the run is cancelled / a loop guard trips.
@@ -256,72 +369,84 @@ export async function runAgent(
             onEvent?.({ type: "model_responded", step: steps, responseType: "tool_call" }, sessionState);
 
             // ---------------------------------------------------------------
-            // Read/Write Partitioned Concurrency
+            // Path-Aware Concurrent Tool Execution
             // ---------------------------------------------------------------
-            // When the model returns multiple tool calls in one response (e.g.
-            // "read these 5 files"), OpenAI buffers them in pendingFunctionCalls.
-            // We collect all consecutive READ-ONLY calls and run them in
-            // parallel via Promise.all(). Write calls execute serially as before.
+            // When the model returns multiple tool calls in one response,
+            // we group them by file path conflicts:
             //
-            // This is the minicode equivalent of Claude Code's
-            // isConcurrencySafe / readers-writer lock pattern
-            // (see Concept #2 in notes/CONCEPTS.md).
+            //   - Calls touching DIFFERENT files → run in parallel
+            //   - Calls touching the SAME file → run in sequence
+            //   - Calls with unknown paths (e.g. bash) → run serially (conservative)
+            //   - Reads never conflict with each other (even on same file)
+            //
+            // This goes beyond Claude Code's approach (which is per-tool-type).
+            // It's row-level locking instead of table-level locking.
             // ---------------------------------------------------------------
 
-            // Collect the current call + any buffered read-only calls into a batch
-            type PendingCall = { toolName: string; args: Record<string, unknown>; tool: ToolDefinition };
-            const readBatch: PendingCall[] = [];
+            const batch: PendingCall[] = [];
 
-            // First call: check if it's a read AND there are more buffered calls.
-            // Skip batching for the agent tool — it has its own concurrency model.
+            // Collect all buffered tool calls into a batch
             const firstTool = step.type === "tool_call" ? toolMap.get(step.call.toolName) : undefined;
-            if (step.type === "tool_call" && firstTool?.accessLevel === "read" && firstTool.name !== "agent" && client.hasPendingToolCalls()) {
+            if (step.type === "tool_call" && firstTool && firstTool.name !== "agent" && client.hasPendingToolCalls()) {
                 const seenSignatures = new Set<string>();
-                const firstSig = getToolCallSignature(step.call.toolName, step.call.args);
-                seenSignatures.add(firstSig);
+                seenSignatures.add(getToolCallSignature(step.call.toolName, step.call.args));
+                batch.push({ toolName: step.call.toolName, args: step.call.args, tool: firstTool });
 
-                // It's a read AND there are more buffered calls — start batching
-                readBatch.push({ toolName: step.call.toolName, args: step.call.args, tool: firstTool });
-
-                // Drain buffered calls, stopping at duplicates or writes
                 while (client.hasPendingToolCalls()) {
                     const nextStep = await client.next({ messages, tools: toolMetadata, signal: options.signal });
                     if (nextStep.type !== "tool_call") break;
                     const nextTool = toolMap.get(nextStep.call.toolName);
                     if (!nextTool) break;
 
-                    // Duplicate detection — a repeated call in a batch is
-                    // likely a model loop. Stop batching and let the serial
-                    // path's loop detector handle it.
                     const sig = getToolCallSignature(nextStep.call.toolName, nextStep.call.args);
                     if (seenSignatures.has(sig)) {
-                        // Put this duplicate into the batch as-is so it goes
-                        // through the serial path below (which has loop detection).
-                        readBatch.push({ toolName: nextStep.call.toolName, args: nextStep.call.args, tool: nextTool });
-                        break;
+                        batch.push({ toolName: nextStep.call.toolName, args: nextStep.call.args, tool: nextTool });
+                        break; // duplicate → stop collecting, let loop detector handle
                     }
                     seenSignatures.add(sig);
-
-                    if (nextTool.accessLevel !== "read") {
-                        // Hit a write tool — include it so it gets executed serially after the reads
-                        readBatch.push({ toolName: nextStep.call.toolName, args: nextStep.call.args, tool: nextTool });
-                        break;
-                    }
-                    readBatch.push({ toolName: nextStep.call.toolName, args: nextStep.call.args, tool: nextTool });
+                    batch.push({ toolName: nextStep.call.toolName, args: nextStep.call.args, tool: nextTool });
                 }
             }
 
-            // If we collected a batch of 2+ calls, execute reads in parallel
-            if (readBatch.length >= 2) {
-                // Partition into reads (parallel) and the trailing write (serial)
-                const reads = readBatch.filter(c => c.tool.accessLevel === "read");
-                const writes = readBatch.filter(c => c.tool.accessLevel !== "read");
+            // If we have 2+ calls, partition into conflict-free parallel groups
+            if (batch.length >= 2) {
+                const groups = buildParallelGroups(batch, executionContext.cwd);
 
-                if (reads.length > 0) {
-                    onEvent?.({ type: "tool_started", toolName: `${reads.length} reads in parallel` }, sessionState);
+                for (const group of groups) {
+                    if (group.length === 1) {
+                        // Single call — if it needs special handling (permissions,
+                        // hooks, plan mode), fall through to the serial path.
+                        // Only auto-execute simple reads here.
+                        const call = group[0]!;
+                        if (call.tool.accessLevel === "read") {
+                            sessionState = recordToolRequested(sessionState, call.toolName, call.args);
+                            onEvent?.({ type: "tool_requested", toolName: call.toolName, args: call.args }, sessionState);
+                            try {
+                                const result = await call.tool.execute(call.args, executionContext);
+                                const preview = result.substring(0, 100);
+                                sessionState = recordToolFinished(sessionState, call.toolName, preview);
+                                onEvent?.({ type: "tool_finished", toolName: call.toolName, preview }, sessionState);
+                                messages.push({ role: "tool", content: result, name: call.toolName });
+                                onEvent?.({ type: "tool_output_appended", toolName: call.toolName }, sessionState);
+                            } catch (error) {
+                                const msg = error instanceof Error ? error.message : String(error);
+                                onEvent?.({ type: "tool_failed", toolName: call.toolName, error: msg }, sessionState);
+                                messages.push({ role: "tool", content: `Error: ${msg}`, name: call.toolName });
+                            }
+                        } else {
+                            // Write tool — fall through to serial path with full
+                            // permission/hook handling
+                            step = { type: "tool_call", call: { toolName: call.toolName, args: call.args } };
+                            break; // exit group loop, continue to serial path below
+                        }
+                        continue;
+                    }
 
-                    const readResults = await Promise.all(
-                        reads.map(async (call) => {
+                    // Multiple non-conflicting calls — run in parallel
+                    onEvent?.({ type: "tool_started", toolName: `${group.length} tools in parallel` }, sessionState);
+
+                    const results = await Promise.all(
+                        group.map(async (call) => {
                             sessionState = recordToolRequested(sessionState, call.toolName, call.args);
                             onEvent?.({ type: "tool_requested", toolName: call.toolName, args: call.args }, sessionState);
                             try {
@@ -338,20 +463,14 @@ export async function runAgent(
                         }),
                     );
 
-                    // Push all read results into messages
-                    for (const { toolName, result } of readResults) {
+                    for (const { toolName, result } of results) {
                         messages.push({ role: "tool", content: result, name: toolName });
                         onEvent?.({ type: "tool_output_appended", toolName }, sessionState);
                     }
                 }
 
-                // Execute any trailing write call serially (falls through to normal path below)
-                if (writes.length > 0) {
-                    const writeCall = writes[0]!;
-                    // Synthesize a step so the normal serial path handles it
-                    step = { type: "tool_call", call: { toolName: writeCall.toolName, args: writeCall.args } };
-                } else {
-                    // All reads done, loop back to ask model for next step
+                // If all groups were processed (no write fell through), skip serial path
+                if (batch.every(c => c.tool.accessLevel === "read")) {
                     continue;
                 }
             }

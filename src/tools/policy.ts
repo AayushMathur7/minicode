@@ -18,6 +18,7 @@ const EXECUTE_MODE_HIDDEN_TOOLS = new Set(["write_plan", "exit_plan_mode"]);
 // subagent, causing unbounded recursion.
 const SUBAGENT_BLOCKED_TOOLS = new Set([
     "agent",           // prevent recursive agent spawning
+    "skill",           // skills are a main-thread concept
     "enter_plan_mode", // plan mode is a main-thread concept
     "exit_plan_mode",
     "write_plan",
