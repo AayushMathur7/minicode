@@ -1,8 +1,5 @@
-import { execFile } from "node:child_process";
-import { promisify } from "node:util";
+import { getExecutionBackend } from "../execution";
 import { type ToolDefinition } from "../types";
-
-const execFileAsync = promisify(execFile);
 
 // Start with a small read-only allowlist. This keeps the tool useful for
 // inspection without turning it into unrestricted shell execution.
@@ -16,12 +13,6 @@ const ALLOWED_COMMANDS = new Set([
 
 const DEFAULT_TIMEOUT_MS = 10_000;
 const DEFAULT_MAX_BUFFER = 1024 * 1024;
-
-type ExecError = Error & {
-    code?: number | string;
-    stdout?: string;
-    stderr?: string;
-};
 
 function assertString(value: unknown, field: string): string {
     if (typeof value !== "string" || value.trim() === "") {
@@ -70,39 +61,36 @@ export const runCommandTool: ToolDefinition = {
     execute: async (args: Record<string, unknown>, context) => {
         const command = assertString(args.command, "command");
         const commandArgs = parseArgs(args.args);
+        const executionBackend = getExecutionBackend();
 
         if (!ALLOWED_COMMANDS.has(command)) {
             return `Command "${command}" is not allowed. Allowed commands: ${[...ALLOWED_COMMANDS].join(", ")}`;
         }
 
-        try {
-            const { stdout, stderr } = await execFileAsync(command, commandArgs, {
-                timeout: DEFAULT_TIMEOUT_MS,
-                maxBuffer: DEFAULT_MAX_BUFFER,
-                cwd: context.cwd,
-                signal: context.signal,
-            });
+        const result = await executionBackend.execute({
+            command,
+            args: commandArgs,
+            cwd: context.cwd,
+            timeoutMs: DEFAULT_TIMEOUT_MS,
+            maxBuffer: DEFAULT_MAX_BUFFER,
+            signal: context.signal,
+        });
 
-            const output = [stdout, stderr]
-                .filter((value) => typeof value === "string" && value.trim().length > 0)
-                .join("\n")
-                .trim();
+        const output = [result.stdout, result.stderr]
+            .filter((value) => value.trim().length > 0)
+            .join("\n")
+            .trim();
 
+        if (result.exitCode === 0) {
             return output || `Command succeeded with no output: ${formatCommand(command, commandArgs)}`;
-        } catch (error) {
-            const execError = error as ExecError;
-            const output = [execError.stdout, execError.stderr]
-                .filter((value) => typeof value === "string" && value.trim().length > 0)
-                .join("\n")
-                .trim();
-
-            if (output) {
-                return output;
-            }
-
-            return `Command failed: ${formatCommand(command, commandArgs)}${
-                execError.message ? `\n${execError.message}` : ""
-            }`;
         }
+
+        if (output) {
+            return output;
+        }
+
+        return `Command failed: ${formatCommand(command, commandArgs)}${
+            result.errorMessage ? `\n${result.errorMessage}` : ""
+        }`;
     },
 };
