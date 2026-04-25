@@ -1,6 +1,6 @@
 import React from "react";
 import { Box, Text, useInput, useStdin } from "ink";
-import { type PermissionRequestState } from "../state";
+import { type PermissionRequestState } from "../../runtime/sessionTypes";
 
 type Props = {
     pendingPermission?: PermissionRequestState;

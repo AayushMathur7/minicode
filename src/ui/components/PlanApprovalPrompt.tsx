@@ -1,6 +1,6 @@
 import React from "react";
 import { Box, Text, useInput, useStdin } from "ink";
-import { type PlanApprovalState } from "../state";
+import { type PlanApprovalState } from "../../runtime/sessionTypes";
 import { RichText } from "./RichText";
 
 type Props = {

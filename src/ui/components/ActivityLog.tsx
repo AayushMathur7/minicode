@@ -1,6 +1,6 @@
 import React from "react";
 import { Box, Text } from "ink";
-import { type RecentEvent } from "../state";
+import { type RecentEvent } from "../../runtime/sessionTypes";
 
 type Props = {
     recentEvents: RecentEvent[];

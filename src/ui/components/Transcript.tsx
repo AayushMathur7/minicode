@@ -1,6 +1,6 @@
 import React from "react";
 import { Box, Text } from "ink";
-import { type TranscriptEntry } from "../state";
+import { type TranscriptEntry } from "../../runtime/sessionTypes";
 import { RichText } from "./RichText";
 
 type Props = {

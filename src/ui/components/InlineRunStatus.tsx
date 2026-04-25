@@ -1,6 +1,6 @@
 import React, { useEffect, useState } from "react";
 import { Text } from "ink";
-import { type ActiveRunState } from "../state";
+import { type ActiveRunState } from "../../runtime/sessionTypes";
 
 type Props = {
     state: ActiveRunState;

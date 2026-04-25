@@ -1,6 +1,6 @@
 import React from "react";
 import { Box, Text } from "ink";
-import { type ActiveRunState } from "../state";
+import { type ActiveRunState } from "../../runtime/sessionTypes";
 
 type Props = {
     state: ActiveRunState;

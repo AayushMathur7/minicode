@@ -1,7 +1,7 @@
 import React from "react";
 import { Box, Text } from "ink";
 import { diffWords, parsePatch, type StructuredPatch } from "diff";
-import { type DiffPreviewState } from "../state";
+import { type DiffPreviewState } from "../../runtime/sessionTypes";
 import { highlightCodeLine, renderCodeToken } from "./codeHighlight";
 
 type Props = {
